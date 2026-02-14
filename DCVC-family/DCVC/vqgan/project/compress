@@ -1,0 +1,1 @@
+python compression_encoder/compression.py compress --input /home/huyang/VqVaeVideo-master/VqVaeVideo-master/data/processedVideo/douyin-v_1z4lxtffe0w_00.08.13_00.08.24_4.00x_1024x1024_alq-12_seg000.mp4 --pattern_path /data/huyang/compression_patten/patten3 --device cuda --gpu-index 5

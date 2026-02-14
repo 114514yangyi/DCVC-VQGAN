@@ -1,0 +1,1 @@
+python compression_vqvae2.py --input '/data/huyang/data/clipdata/03008.mp4' --checkpoint '/data/huyang/save_datacuda_3/checkpoint300000.pth.tar' --config '/home/huyang/VqVaeVideo-master/VqVaeVideo-master/multitask/task1.json' --output '/home/huyang/VqVaeVideo-master/VqVaeVideo-master/temp/reconstructed_512_64.mp4' --device 'cuda:3'

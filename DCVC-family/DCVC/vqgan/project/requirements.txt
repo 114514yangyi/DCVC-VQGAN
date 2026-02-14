@@ -1,0 +1,20 @@
+# need to run this cmd before
+# pip install git+https://github.com/gburlet/YouTokenToMe.git@dependencies
+# the version of python is 3.9
+
+numpy>=1.16.4
+matplotlib==3.3.1
+Pillow>=6.1.0
+scipy>=1.2.2
+imageio>=2.5.0
+six==1.14.0
+tqdm==4.48.2
+h5py
+efficientnet-pytorch==0.7.0
+torchvision
+scikit-learn==0.24.1
+# nvidia-pyindex==1.0.8
+dalle-pytorch==0.11.0
+wandb==0.10.30
+opencv-python>=4.5.0
+albumentations
