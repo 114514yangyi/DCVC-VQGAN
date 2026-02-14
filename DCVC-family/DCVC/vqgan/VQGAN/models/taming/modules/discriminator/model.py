@@ -2,7 +2,10 @@ import functools
 import torch.nn as nn
 
 
-from taming.modules.util import ActNorm
+try:
+    from models.taming.modules.util import ActNorm
+except ImportError:
+    from taming.modules.util import ActNorm
 
 
 def weights_init(m):
