@@ -10,3 +10,4 @@ build/
 *.log
 *.pth
 *.sh
+*.pt

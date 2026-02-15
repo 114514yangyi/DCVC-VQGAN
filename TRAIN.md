@@ -129,13 +129,13 @@ python -c "import cv2; print(f'OpenCV {cv2.__version__}')"  # 视频数据集需
 
 ## 训练概述
 
-DCVC 模型采用**多阶段渐进式训练策略**，通过分阶段训练不同的模块，逐步优化整个视频压缩系统。训练过程分为 5 个主要阶段，每个阶段专注于不同的组件和优化目标。
+DCVC 模型采用**多阶段渐进式训练策略**，通过分阶段训练不同的模块，逐步优化整个视频压缩系统。训练过程分为 4 个主要阶段，每个阶段专注于不同的组件和优化目标。
 
 ### 训练流程总览
 
 ```
 Stage 1 (运动估计) → Stage 2 (残差编码) → Stage 3 (带比特成本的残差编码) 
-→ Stage 4 (端到端优化) → Stage 5 (BVI-AOM 微调，可选)
+→ Stage 4 (端到端优化)
 ```
 
 ### 关键特性
@@ -143,7 +143,7 @@ Stage 1 (运动估计) → Stage 2 (残差编码) → Stage 3 (带比特成本�
 - **多阶段训练**：分阶段训练不同模块，避免训练不稳定
 - **GOP 渐进式训练**：在每个阶段内，GOP 大小从 2 → 3 → 5 → 7 逐步增加
 - **学习率重置**：每次增加 GOP 大小时，需要重置学习率到 1e-4
-- **I-frame 压缩**：使用 CompressAI 预训练的 I-frame 模型
+- **I-frame 压缩**：支持 CompressAI 预训练的 I-frame 模型或 VQGAN 模型
 - **真实熵编码**：基于 CompressAI 的真实熵编码支持
 
 ---
@@ -257,29 +257,7 @@ BPP_total = BPP_y + BPP_z + BPP_mv_y + BPP_mv_z
 - 考虑整个 GOP 的误差传播
 - 适合长 GOP 序列的微调
 
-### Stage 5: BVI-AOM 数据集微调（可选）
-
-**目标**：在 BVI-AOM 数据集上进行微调，适应更长的序列
-
-**训练内容**：
-- 所有模块参与微调
-- 使用 32 帧 GOP 大小（默认）
-
-**损失函数**：
-```
-L_finetune = λ * MSE(recon_image, input_image) + BPP_total
-```
-
-**特殊设置**：
-- 使用 BVI-AOM 数据集（64 帧序列）
-- GOP 大小：32 帧（`--finetune_gop_size 32`）
-- 总是使用 GOP 级别优化
-- 较小的批次大小（默认 2）
-
-**训练策略**：
-- 从 Stage 4 的最佳检查点开始
-- 适应更长的视频序列
-- 提高模型在长序列上的性能
+**注意**：当前版本的 `train_dcvc.py` 仅支持 Stage 1-4，不支持 Stage 5 微调。如需进行长序列微调，请参考代码库的其他实现或等待后续更新。
 
 ---
 
@@ -313,13 +291,12 @@ GOP 2 → GOP 3 → GOP 5 → GOP 7
 ```bash
 # 训练几个 epoch（例如 5-10 个）
 CUDA_VISIBLE_DEVICES=0 accelerate launch DCVC-family/DCVC/train_dcvc.py \
-  --vimeo_dir /path/to/vimeo_septuplet/sequences \
-  --septuplet_list /path/to/sep_trainlist.txt \
-  --hevc_b_dir /path/to/HEVC-B/sequences \
+  --train_video_dir /root/DCVC-VQGAN/DCVC-family/data \
+  --val_video_dir /root/DCVC-VQGAN/DCVC-family/data \
   --checkpoint_dir ./checkpoints \
   --i_frame_model_name cheng2020-anchor \
   --i_frame_quality 6 \
-  --lambda_value 2048 \
+  --lambda_value 512 \
   --quality_index 4 \
   --stage 1 \
   --gop_size 2 \
@@ -327,16 +304,16 @@ CUDA_VISIBLE_DEVICES=0 accelerate launch DCVC-family/DCVC/train_dcvc.py \
   --batch_size 4 \
   --learning_rate 1e-4 \
   --crop_size 256 \
-  --eval_freq 1
+  --eval_freq 100 \
+  --num_workers 4
 ```
 
 **macOS (Apple Silicon/Intel)**:
 ```bash
 # 训练几个 epoch（例如 5-10 个）
 python DCVC-family/DCVC/train_dcvc.py \
-  --vimeo_dir /path/to/vimeo_septuplet/sequences \
-  --septuplet_list /path/to/sep_trainlist.txt \
-  --hevc_b_dir /path/to/HEVC-B/sequences \
+  --train_video_dir /path/to/train/videos \
+  --val_video_dir /path/to/val/videos \
   --checkpoint_dir ./checkpoints \
   --i_frame_model_name cheng2020-anchor \
   --i_frame_quality 6 \
@@ -348,7 +325,8 @@ python DCVC-family/DCVC/train_dcvc.py \
   --batch_size 4 \
   --learning_rate 1e-4 \
   --crop_size 256 \
-  --eval_freq 1
+  --eval_freq 1 \
+  --num_workers 4
 ```
 
 #### 步骤 2: 增加到 GOP 3，重置学习率
@@ -357,31 +335,30 @@ python DCVC-family/DCVC/train_dcvc.py \
 ```bash
 # 重要：必须使用 --force_learning_rate 1e-4 重置学习率
 CUDA_VISIBLE_DEVICES=0 accelerate launch DCVC-family/DCVC/train_dcvc.py \
-  --vimeo_dir /path/to/vimeo_septuplet/sequences \
-  --septuplet_list /path/to/sep_trainlist.txt \
-  --hevc_b_dir /path/to/HEVC-B/sequences \
+  --train_video_dir /root/DCVC-VQGAN/DCVC-family/data \
+  --val_video_dir /root/DCVC-VQGAN/DCVC-family/data \
   --checkpoint_dir ./checkpoints \
   --i_frame_model_name cheng2020-anchor \
   --i_frame_quality 6 \
-  --lambda_value 2048 \
+  --lambda_value 512 \
   --quality_index 4 \
   --stage 1 \
   --gop_size 3 \
-  --epochs 10 \
+  --epochs 20 \
   --batch_size 4 \
   --force_learning_rate 1e-4 \
-  --resume ./checkpoints/model_dcvc_lambda_2048.0_quality_4_stage_1_latest.pth \
+  --resume checkpoints/model_dcvc_lambda_512.0_quality_4_stage_1_best.pth \
   --crop_size 256 \
-  --eval_freq 1
+  --eval_freq 100 \
+  --num_workers 4
 ```
 
 **macOS (Apple Silicon/Intel)**:
 ```bash
 # 重要：必须使用 --force_learning_rate 1e-4 重置学习率
 python DCVC-family/DCVC/train_dcvc.py \
-  --vimeo_dir /path/to/vimeo_septuplet/sequences \
-  --septuplet_list /path/to/sep_trainlist.txt \
-  --hevc_b_dir /path/to/HEVC-B/sequences \
+  --train_video_dir /path/to/train/videos \
+  --val_video_dir /path/to/val/videos \
   --checkpoint_dir ./checkpoints \
   --i_frame_model_name cheng2020-anchor \
   --i_frame_quality 6 \
@@ -394,7 +371,8 @@ python DCVC-family/DCVC/train_dcvc.py \
   --force_learning_rate 1e-4 \
   --resume ./checkpoints/model_dcvc_lambda_2048.0_quality_4_stage_1_latest.pth \
   --crop_size 256 \
-  --eval_freq 1
+  --eval_freq 1 \
+  --num_workers 4
 ```
 
 #### 步骤 3: 增加到 GOP 5，重置学习率
@@ -402,9 +380,8 @@ python DCVC-family/DCVC/train_dcvc.py \
 **Linux (CUDA)**:
 ```bash
 CUDA_VISIBLE_DEVICES=0 accelerate launch DCVC-family/DCVC/train_dcvc.py \
-  --vimeo_dir /path/to/vimeo_septuplet/sequences \
-  --septuplet_list /path/to/sep_trainlist.txt \
-  --hevc_b_dir /path/to/HEVC-B/sequences \
+  --train_video_dir /path/to/train/videos \
+  --val_video_dir /path/to/val/videos \
   --checkpoint_dir ./checkpoints \
   --i_frame_model_name cheng2020-anchor \
   --i_frame_quality 6 \
@@ -417,15 +394,15 @@ CUDA_VISIBLE_DEVICES=0 accelerate launch DCVC-family/DCVC/train_dcvc.py \
   --force_learning_rate 1e-4 \
   --resume ./checkpoints/model_dcvc_lambda_2048.0_quality_4_stage_1_latest.pth \
   --crop_size 256 \
-  --eval_freq 1
+  --eval_freq 1 \
+  --num_workers 4
 ```
 
 **macOS (Apple Silicon/Intel)**:
 ```bash
 python DCVC-family/DCVC/train_dcvc.py \
-  --vimeo_dir /path/to/vimeo_septuplet/sequences \
-  --septuplet_list /path/to/sep_trainlist.txt \
-  --hevc_b_dir /path/to/HEVC-B/sequences \
+  --train_video_dir /path/to/train/videos \
+  --val_video_dir /path/to/val/videos \
   --checkpoint_dir ./checkpoints \
   --i_frame_model_name cheng2020-anchor \
   --i_frame_quality 6 \
@@ -438,7 +415,8 @@ python DCVC-family/DCVC/train_dcvc.py \
   --force_learning_rate 1e-4 \
   --resume ./checkpoints/model_dcvc_lambda_2048.0_quality_4_stage_1_latest.pth \
   --crop_size 256 \
-  --eval_freq 1
+  --eval_freq 1 \
+  --num_workers 4
 ```
 
 #### 步骤 4: 增加到 GOP 7，重置学习率
@@ -446,9 +424,8 @@ python DCVC-family/DCVC/train_dcvc.py \
 **Linux (CUDA)**:
 ```bash
 CUDA_VISIBLE_DEVICES=0 accelerate launch DCVC-family/DCVC/train_dcvc.py \
-  --vimeo_dir /path/to/vimeo_septuplet/sequences \
-  --septuplet_list /path/to/sep_trainlist.txt \
-  --hevc_b_dir /path/to/HEVC-B/sequences \
+  --train_video_dir /path/to/train/videos \
+  --val_video_dir /path/to/val/videos \
   --checkpoint_dir ./checkpoints \
   --i_frame_model_name cheng2020-anchor \
   --i_frame_quality 6 \
@@ -461,15 +438,15 @@ CUDA_VISIBLE_DEVICES=0 accelerate launch DCVC-family/DCVC/train_dcvc.py \
   --force_learning_rate 1e-4 \
   --resume ./checkpoints/model_dcvc_lambda_2048.0_quality_4_stage_1_latest.pth \
   --crop_size 256 \
-  --eval_freq 1
+  --eval_freq 1 \
+  --num_workers 4
 ```
 
 **macOS (Apple Silicon/Intel)**:
 ```bash
 python DCVC-family/DCVC/train_dcvc.py \
-  --vimeo_dir /path/to/vimeo_septuplet/sequences \
-  --septuplet_list /path/to/sep_trainlist.txt \
-  --hevc_b_dir /path/to/HEVC-B/sequences \
+  --train_video_dir /path/to/train/videos \
+  --val_video_dir /path/to/val/videos \
   --checkpoint_dir ./checkpoints \
   --i_frame_model_name cheng2020-anchor \
   --i_frame_quality 6 \
@@ -482,7 +459,8 @@ python DCVC-family/DCVC/train_dcvc.py \
   --force_learning_rate 1e-4 \
   --resume ./checkpoints/model_dcvc_lambda_2048.0_quality_4_stage_1_latest.pth \
   --crop_size 256 \
-  --eval_freq 1
+  --eval_freq 1 \
+  --num_workers 4
 ```
 
 ### 关键注意事项
@@ -537,7 +515,6 @@ val_videos/
 
 **使用方法**：
 ```bash
---use_video_dataset \
 --train_video_dir /path/to/train/videos \
 --val_video_dir /path/to/val/videos
 ```
@@ -551,126 +528,7 @@ val_videos/
 - 视频文件必须是 MP4 格式
 - 建议视频分辨率至少为 256x256
 - 视频长度应至少包含 GOP 大小的帧数
-
-### Vimeo-90k 数据集（图片序列，传统方式）
-
-**用途**：Stage 1-4 的主要训练数据集（如果不使用视频数据集）
-
-**下载**：
-- 从 [Vimeo90k 官网](http://toflow.csail.mit.edu/) 下载
-- 需要 septuplet 数据集（7 帧序列）
-
-**目录结构**：
-```
-vimeo_septuplet/
-└── sequences/
-    ├── 00001/
-    │   ├── im1.png
-    │   ├── im2.png
-    │   ├── ...
-    │   └── im7.png
-    ├── 00002/
-    └── ...
-```
-
-**训练列表文件**：
-- 需要 `sep_trainlist.txt` 文件
-- 每行一个序列路径，例如：`00001/0001`
-
-**使用方法**：
-```bash
-# 不使用 --use_video_dataset，使用传统方式
---vimeo_dir /path/to/vimeo_septuplet/sequences
---septuplet_list /path/to/sep_trainlist.txt
-```
-
-**数据增强**：
-- 随机裁剪：`--crop_size 256`（默认）
-- 随机选择 GOP 起始帧（从 7 帧中随机选择连续 GOP 大小的帧）
-
-### HEVC-B 数据集（评估数据集）
-
-**用途**：训练过程中的验证和评估
-
-**支持两种格式**：
-
-#### 方式 1：MP4 视频格式（推荐）
-
-**目录结构**：
-```
-val_videos/
-├── BQTerrace.mp4
-├── BasketballDrive.mp4
-├── Cactus.mp4
-├── Kimono.mp4
-└── ParkScene.mp4
-```
-
-**使用方法**：
-```bash
---use_video_dataset \
---val_video_dir /path/to/val/videos \
---eval_freq 1
-```
-
-#### 方式 2：图片序列格式（传统方式）
-
-**准备步骤**：
-1. 将 YUV 序列转换为 RGB PNG 格式
-2. 每个序列至少 96 帧（`--eval_max_frames 96`）
-3. 使用 32 帧 GOP 进行评估
-
-**目录结构**：
-```
-HEVC-B/
-├── BQTerrace/
-│   ├── frame_0001.png
-│   ├── frame_0002.png
-│   └── ...
-├── BasketballDrive/
-└── ...
-```
-
-**使用方法**：
-```bash
-# 不使用 --use_video_dataset
---hevc_b_dir /path/to/HEVC-B/sequences
---eval_freq 1  # 每个 epoch 评估一次
-```
-
-**序列**：
-- BQTerrace
-- BasketballDrive
-- Cactus
-- Kimono
-- ParkScene
-
-### BVI-AOM 数据集（Stage 5 微调）
-
-**用途**：Stage 5 的微调数据集（可选）
-
-**特点**：
-- 64 帧长序列
-- 高质量视频内容
-- 用于长序列微调
-
-**目录结构**：
-```
-BVI-AOM/
-├── sequence_001/
-│   ├── frame_0001.png
-│   ├── frame_0002.png
-│   └── ...
-├── sequence_002/
-└── ...
-```
-
-**使用方法**：
-```bash
---bvi_aom_dir /path/to/BVI-AOM
---finetune_gop_size 32
---finetune_max_sequences 100  # 可选：限制序列数量
-```
+- 验证视频目录用于训练过程中的评估
 
 ---
 
@@ -682,62 +540,16 @@ BVI-AOM/
 
 #### Stage 1: 运动估计训练（GOP 渐进式）
 
-**使用 MP4 视频数据集（推荐）**：
+**使用 CompressAI I-frame 模型（默认）**：
 
 **Linux (CUDA)**:
 ```bash
 # ========== Stage 1, GOP 2 ==========
 CUDA_VISIBLE_DEVICES=0 accelerate launch DCVC-family/DCVC/train_dcvc.py \
-  --use_video_dataset \
   --train_video_dir /path/to/train/videos \
   --val_video_dir /path/to/val/videos \
   --checkpoint_dir ./checkpoints \
-  --i_frame_model_name cheng2020-anchor \
-  --i_frame_quality 6 \
-  --lambda_value 2048 \
-  --quality_index 4 \
-  --stage 1 \
-  --epochs 10 \
-  --batch_size 4 \
-  --gop_size 2 \
-  --learning_rate 1e-4 \
-  --crop_size 256 \
-  --eval_freq 1 \
-  --num_workers 4
-```
-
-**macOS (Apple Silicon/Intel)**:
-```bash
-# ========== Stage 1, GOP 2 ==========
-python DCVC-family/DCVC/train_dcvc.py \
-  --use_video_dataset \
-  --train_video_dir /Users/mac/Projects/opendcvcs/DCVC-family/data \
-  --val_video_dir /Users/mac/Projects/opendcvcs/DCVC-family/data \
-  --checkpoint_dir ./checkpoints \
-  --i_frame_model_name cheng2020-anchor \
-  --i_frame_quality 6 \
-  --lambda_value 2048 \
-  --quality_index 4 \
-  --stage 1 \
-  --epochs 10 \
-  --batch_size 4 \
-  --gop_size 2 \
-  --learning_rate 1e-4 \
-  --crop_size 256 \
-  --eval_freq 1 \
-  --num_workers 4
-```
-
-**使用图片序列数据集（传统方式）**：
-
-**Linux (CUDA)**:
-```bash
-# ========== Stage 1, GOP 2 ==========
-CUDA_VISIBLE_DEVICES=0 accelerate launch DCVC-family/DCVC/train_dcvc.py \
-  --vimeo_dir /path/to/vimeo_septuplet/sequences \
-  --septuplet_list /path/to/sep_trainlist.txt \
-  --hevc_b_dir /path/to/HEVC-B/sequences \
-  --checkpoint_dir ./checkpoints \
+  --i_frame_type compressai \
   --i_frame_model_name cheng2020-anchor \
   --i_frame_quality 6 \
   --lambda_value 2048 \
@@ -753,10 +565,10 @@ CUDA_VISIBLE_DEVICES=0 accelerate launch DCVC-family/DCVC/train_dcvc.py \
 
 # ========== Stage 1, GOP 3 ==========
 CUDA_VISIBLE_DEVICES=0 accelerate launch DCVC-family/DCVC/train_dcvc.py \
-  --vimeo_dir /path/to/vimeo_septuplet/sequences \
-  --septuplet_list /path/to/sep_trainlist.txt \
-  --hevc_b_dir /path/to/HEVC-B/sequences \
+  --train_video_dir /path/to/train/videos \
+  --val_video_dir /path/to/val/videos \
   --checkpoint_dir ./checkpoints \
+  --i_frame_type compressai \
   --i_frame_model_name cheng2020-anchor \
   --i_frame_quality 6 \
   --lambda_value 2048 \
@@ -773,10 +585,10 @@ CUDA_VISIBLE_DEVICES=0 accelerate launch DCVC-family/DCVC/train_dcvc.py \
 
 # ========== Stage 1, GOP 5 ==========
 CUDA_VISIBLE_DEVICES=0 accelerate launch DCVC-family/DCVC/train_dcvc.py \
-  --vimeo_dir /path/to/vimeo_septuplet/sequences \
-  --septuplet_list /path/to/sep_trainlist.txt \
-  --hevc_b_dir /path/to/HEVC-B/sequences \
+  --train_video_dir /path/to/train/videos \
+  --val_video_dir /path/to/val/videos \
   --checkpoint_dir ./checkpoints \
+  --i_frame_type compressai \
   --i_frame_model_name cheng2020-anchor \
   --i_frame_quality 6 \
   --lambda_value 2048 \
@@ -793,10 +605,10 @@ CUDA_VISIBLE_DEVICES=0 accelerate launch DCVC-family/DCVC/train_dcvc.py \
 
 # ========== Stage 1, GOP 7 ==========
 CUDA_VISIBLE_DEVICES=0 accelerate launch DCVC-family/DCVC/train_dcvc.py \
-  --vimeo_dir /path/to/vimeo_septuplet/sequences \
-  --septuplet_list /path/to/sep_trainlist.txt \
-  --hevc_b_dir /path/to/HEVC-B/sequences \
+  --train_video_dir /path/to/train/videos \
+  --val_video_dir /path/to/val/videos \
   --checkpoint_dir ./checkpoints \
+  --i_frame_type compressai \
   --i_frame_model_name cheng2020-anchor \
   --i_frame_quality 6 \
   --lambda_value 2048 \
@@ -816,10 +628,10 @@ CUDA_VISIBLE_DEVICES=0 accelerate launch DCVC-family/DCVC/train_dcvc.py \
 ```bash
 # ========== Stage 1, GOP 2 ==========
 python DCVC-family/DCVC/train_dcvc.py \
-  --vimeo_dir /path/to/vimeo_septuplet/sequences \
-  --septuplet_list /path/to/sep_trainlist.txt \
-  --hevc_b_dir /path/to/HEVC-B/sequences \
+  --train_video_dir /path/to/train/videos \
+  --val_video_dir /path/to/val/videos \
   --checkpoint_dir ./checkpoints \
+  --i_frame_type compressai \
   --i_frame_model_name cheng2020-anchor \
   --i_frame_quality 6 \
   --lambda_value 2048 \
@@ -833,12 +645,31 @@ python DCVC-family/DCVC/train_dcvc.py \
   --eval_freq 1 \
   --num_workers 4
 
+# ========== Stage 1, GOP 2 (使用 VQGAN I-frame) ==========
+python DCVC-family/DCVC/train_dcvc.py \
+  --train_video_dir /path/to/train/videos \
+  --val_video_dir /path/to/val/videos \
+  --checkpoint_dir ./checkpoints \
+  --i_frame_type vqgan \
+  --vqgan_config /path/to/vqgan_config.json \
+  --vqgan_checkpoint /path/to/vqgan_checkpoint.pth \
+  --lambda_value 2048 \
+  --quality_index 4 \
+  --stage 1 \
+  --epochs 10 \
+  --batch_size 4 \
+  --gop_size 2 \
+  --learning_rate 1e-4 \
+  --crop_size 256 \
+  --eval_freq 1 \
+  --num_workers 4
+
 # ========== Stage 1, GOP 3 ==========
 python DCVC-family/DCVC/train_dcvc.py \
-  --vimeo_dir /path/to/vimeo_septuplet/sequences \
-  --septuplet_list /path/to/sep_trainlist.txt \
-  --hevc_b_dir /path/to/HEVC-B/sequences \
+  --train_video_dir /path/to/train/videos \
+  --val_video_dir /path/to/val/videos \
   --checkpoint_dir ./checkpoints \
+  --i_frame_type compressai \
   --i_frame_model_name cheng2020-anchor \
   --i_frame_quality 6 \
   --lambda_value 2048 \
@@ -855,10 +686,10 @@ python DCVC-family/DCVC/train_dcvc.py \
 
 # ========== Stage 1, GOP 5 ==========
 python DCVC-family/DCVC/train_dcvc.py \
-  --vimeo_dir /path/to/vimeo_septuplet/sequences \
-  --septuplet_list /path/to/sep_trainlist.txt \
-  --hevc_b_dir /path/to/HEVC-B/sequences \
+  --train_video_dir /path/to/train/videos \
+  --val_video_dir /path/to/val/videos \
   --checkpoint_dir ./checkpoints \
+  --i_frame_type compressai \
   --i_frame_model_name cheng2020-anchor \
   --i_frame_quality 6 \
   --lambda_value 2048 \
@@ -875,10 +706,10 @@ python DCVC-family/DCVC/train_dcvc.py \
 
 # ========== Stage 1, GOP 7 ==========
 python DCVC-family/DCVC/train_dcvc.py \
-  --vimeo_dir /path/to/vimeo_septuplet/sequences \
-  --septuplet_list /path/to/sep_trainlist.txt \
-  --hevc_b_dir /path/to/HEVC-B/sequences \
+  --train_video_dir /path/to/train/videos \
+  --val_video_dir /path/to/val/videos \
   --checkpoint_dir ./checkpoints \
+  --i_frame_type compressai \
   --i_frame_model_name cheng2020-anchor \
   --i_frame_quality 6 \
   --lambda_value 2048 \
@@ -900,10 +731,10 @@ python DCVC-family/DCVC/train_dcvc.py \
 ```bash
 # ========== Stage 2, GOP 2 ==========
 CUDA_VISIBLE_DEVICES=0 accelerate launch DCVC-family/DCVC/train_dcvc.py \
-  --vimeo_dir /path/to/vimeo_septuplet/sequences \
-  --septuplet_list /path/to/sep_trainlist.txt \
-  --hevc_b_dir /path/to/HEVC-B/sequences \
+  --train_video_dir /path/to/train/videos \
+  --val_video_dir /path/to/val/videos \
   --checkpoint_dir ./checkpoints \
+  --i_frame_type compressai \
   --i_frame_model_name cheng2020-anchor \
   --i_frame_quality 6 \
   --lambda_value 2048 \
@@ -920,10 +751,10 @@ CUDA_VISIBLE_DEVICES=0 accelerate launch DCVC-family/DCVC/train_dcvc.py \
 
 # ========== Stage 2, GOP 3 ==========
 CUDA_VISIBLE_DEVICES=0 accelerate launch DCVC-family/DCVC/train_dcvc.py \
-  --vimeo_dir /path/to/vimeo_septuplet/sequences \
-  --septuplet_list /path/to/sep_trainlist.txt \
-  --hevc_b_dir /path/to/HEVC-B/sequences \
+  --train_video_dir /path/to/train/videos \
+  --val_video_dir /path/to/val/videos \
   --checkpoint_dir ./checkpoints \
+  --i_frame_type compressai \
   --i_frame_model_name cheng2020-anchor \
   --i_frame_quality 6 \
   --lambda_value 2048 \
@@ -940,10 +771,10 @@ CUDA_VISIBLE_DEVICES=0 accelerate launch DCVC-family/DCVC/train_dcvc.py \
 
 # ========== Stage 2, GOP 5 ==========
 CUDA_VISIBLE_DEVICES=0 accelerate launch DCVC-family/DCVC/train_dcvc.py \
-  --vimeo_dir /path/to/vimeo_septuplet/sequences \
-  --septuplet_list /path/to/sep_trainlist.txt \
-  --hevc_b_dir /path/to/HEVC-B/sequences \
+  --train_video_dir /path/to/train/videos \
+  --val_video_dir /path/to/val/videos \
   --checkpoint_dir ./checkpoints \
+  --i_frame_type compressai \
   --i_frame_model_name cheng2020-anchor \
   --i_frame_quality 6 \
   --lambda_value 2048 \
@@ -960,10 +791,10 @@ CUDA_VISIBLE_DEVICES=0 accelerate launch DCVC-family/DCVC/train_dcvc.py \
 
 # ========== Stage 2, GOP 7 ==========
 CUDA_VISIBLE_DEVICES=0 accelerate launch DCVC-family/DCVC/train_dcvc.py \
-  --vimeo_dir /path/to/vimeo_septuplet/sequences \
-  --septuplet_list /path/to/sep_trainlist.txt \
-  --hevc_b_dir /path/to/HEVC-B/sequences \
+  --train_video_dir /path/to/train/videos \
+  --val_video_dir /path/to/val/videos \
   --checkpoint_dir ./checkpoints \
+  --i_frame_type compressai \
   --i_frame_model_name cheng2020-anchor \
   --i_frame_quality 6 \
   --lambda_value 2048 \
@@ -983,10 +814,10 @@ CUDA_VISIBLE_DEVICES=0 accelerate launch DCVC-family/DCVC/train_dcvc.py \
 ```bash
 # ========== Stage 2, GOP 2 ==========
 python DCVC-family/DCVC/train_dcvc.py \
-  --vimeo_dir /path/to/vimeo_septuplet/sequences \
-  --septuplet_list /path/to/sep_trainlist.txt \
-  --hevc_b_dir /path/to/HEVC-B/sequences \
+  --train_video_dir /path/to/train/videos \
+  --val_video_dir /path/to/val/videos \
   --checkpoint_dir ./checkpoints \
+  --i_frame_type compressai \
   --i_frame_model_name cheng2020-anchor \
   --i_frame_quality 6 \
   --lambda_value 2048 \
@@ -1003,10 +834,10 @@ python DCVC-family/DCVC/train_dcvc.py \
 
 # ========== Stage 2, GOP 3 ==========
 python DCVC-family/DCVC/train_dcvc.py \
-  --vimeo_dir /path/to/vimeo_septuplet/sequences \
-  --septuplet_list /path/to/sep_trainlist.txt \
-  --hevc_b_dir /path/to/HEVC-B/sequences \
+  --train_video_dir /path/to/train/videos \
+  --val_video_dir /path/to/val/videos \
   --checkpoint_dir ./checkpoints \
+  --i_frame_type compressai \
   --i_frame_model_name cheng2020-anchor \
   --i_frame_quality 6 \
   --lambda_value 2048 \
@@ -1023,10 +854,10 @@ python DCVC-family/DCVC/train_dcvc.py \
 
 # ========== Stage 2, GOP 5 ==========
 python DCVC-family/DCVC/train_dcvc.py \
-  --vimeo_dir /path/to/vimeo_septuplet/sequences \
-  --septuplet_list /path/to/sep_trainlist.txt \
-  --hevc_b_dir /path/to/HEVC-B/sequences \
+  --train_video_dir /path/to/train/videos \
+  --val_video_dir /path/to/val/videos \
   --checkpoint_dir ./checkpoints \
+  --i_frame_type compressai \
   --i_frame_model_name cheng2020-anchor \
   --i_frame_quality 6 \
   --lambda_value 2048 \
@@ -1043,10 +874,10 @@ python DCVC-family/DCVC/train_dcvc.py \
 
 # ========== Stage 2, GOP 7 ==========
 python DCVC-family/DCVC/train_dcvc.py \
-  --vimeo_dir /path/to/vimeo_septuplet/sequences \
-  --septuplet_list /path/to/sep_trainlist.txt \
-  --hevc_b_dir /path/to/HEVC-B/sequences \
+  --train_video_dir /path/to/train/videos \
+  --val_video_dir /path/to/val/videos \
   --checkpoint_dir ./checkpoints \
+  --i_frame_type compressai \
   --i_frame_model_name cheng2020-anchor \
   --i_frame_quality 6 \
   --lambda_value 2048 \
@@ -1068,10 +899,10 @@ python DCVC-family/DCVC/train_dcvc.py \
 ```bash
 # ========== Stage 3, GOP 2 ==========
 CUDA_VISIBLE_DEVICES=0 accelerate launch DCVC-family/DCVC/train_dcvc.py \
-  --vimeo_dir /path/to/vimeo_septuplet/sequences \
-  --septuplet_list /path/to/sep_trainlist.txt \
-  --hevc_b_dir /path/to/HEVC-B/sequences \
+  --train_video_dir /path/to/train/videos \
+  --val_video_dir /path/to/val/videos \
   --checkpoint_dir ./checkpoints \
+  --i_frame_type compressai \
   --i_frame_model_name cheng2020-anchor \
   --i_frame_quality 6 \
   --lambda_value 2048 \
@@ -1088,10 +919,10 @@ CUDA_VISIBLE_DEVICES=0 accelerate launch DCVC-family/DCVC/train_dcvc.py \
 
 # ========== Stage 3, GOP 3 ==========
 CUDA_VISIBLE_DEVICES=0 accelerate launch DCVC-family/DCVC/train_dcvc.py \
-  --vimeo_dir /path/to/vimeo_septuplet/sequences \
-  --septuplet_list /path/to/sep_trainlist.txt \
-  --hevc_b_dir /path/to/HEVC-B/sequences \
+  --train_video_dir /path/to/train/videos \
+  --val_video_dir /path/to/val/videos \
   --checkpoint_dir ./checkpoints \
+  --i_frame_type compressai \
   --i_frame_model_name cheng2020-anchor \
   --i_frame_quality 6 \
   --lambda_value 2048 \
@@ -1108,10 +939,10 @@ CUDA_VISIBLE_DEVICES=0 accelerate launch DCVC-family/DCVC/train_dcvc.py \
 
 # ========== Stage 3, GOP 5 ==========
 CUDA_VISIBLE_DEVICES=0 accelerate launch DCVC-family/DCVC/train_dcvc.py \
-  --vimeo_dir /path/to/vimeo_septuplet/sequences \
-  --septuplet_list /path/to/sep_trainlist.txt \
-  --hevc_b_dir /path/to/HEVC-B/sequences \
+  --train_video_dir /path/to/train/videos \
+  --val_video_dir /path/to/val/videos \
   --checkpoint_dir ./checkpoints \
+  --i_frame_type compressai \
   --i_frame_model_name cheng2020-anchor \
   --i_frame_quality 6 \
   --lambda_value 2048 \
@@ -1128,10 +959,10 @@ CUDA_VISIBLE_DEVICES=0 accelerate launch DCVC-family/DCVC/train_dcvc.py \
 
 # ========== Stage 3, GOP 7 ==========
 CUDA_VISIBLE_DEVICES=0 accelerate launch DCVC-family/DCVC/train_dcvc.py \
-  --vimeo_dir /path/to/vimeo_septuplet/sequences \
-  --septuplet_list /path/to/sep_trainlist.txt \
-  --hevc_b_dir /path/to/HEVC-B/sequences \
+  --train_video_dir /path/to/train/videos \
+  --val_video_dir /path/to/val/videos \
   --checkpoint_dir ./checkpoints \
+  --i_frame_type compressai \
   --i_frame_model_name cheng2020-anchor \
   --i_frame_quality 6 \
   --lambda_value 2048 \
@@ -1151,10 +982,10 @@ CUDA_VISIBLE_DEVICES=0 accelerate launch DCVC-family/DCVC/train_dcvc.py \
 ```bash
 # ========== Stage 3, GOP 2 ==========
 python DCVC-family/DCVC/train_dcvc.py \
-  --vimeo_dir /path/to/vimeo_septuplet/sequences \
-  --septuplet_list /path/to/sep_trainlist.txt \
-  --hevc_b_dir /path/to/HEVC-B/sequences \
+  --train_video_dir /path/to/train/videos \
+  --val_video_dir /path/to/val/videos \
   --checkpoint_dir ./checkpoints \
+  --i_frame_type compressai \
   --i_frame_model_name cheng2020-anchor \
   --i_frame_quality 6 \
   --lambda_value 2048 \
@@ -1171,10 +1002,10 @@ python DCVC-family/DCVC/train_dcvc.py \
 
 # ========== Stage 3, GOP 3 ==========
 python DCVC-family/DCVC/train_dcvc.py \
-  --vimeo_dir /path/to/vimeo_septuplet/sequences \
-  --septuplet_list /path/to/sep_trainlist.txt \
-  --hevc_b_dir /path/to/HEVC-B/sequences \
+  --train_video_dir /path/to/train/videos \
+  --val_video_dir /path/to/val/videos \
   --checkpoint_dir ./checkpoints \
+  --i_frame_type compressai \
   --i_frame_model_name cheng2020-anchor \
   --i_frame_quality 6 \
   --lambda_value 2048 \
@@ -1191,10 +1022,10 @@ python DCVC-family/DCVC/train_dcvc.py \
 
 # ========== Stage 3, GOP 5 ==========
 python DCVC-family/DCVC/train_dcvc.py \
-  --vimeo_dir /path/to/vimeo_septuplet/sequences \
-  --septuplet_list /path/to/sep_trainlist.txt \
-  --hevc_b_dir /path/to/HEVC-B/sequences \
+  --train_video_dir /path/to/train/videos \
+  --val_video_dir /path/to/val/videos \
   --checkpoint_dir ./checkpoints \
+  --i_frame_type compressai \
   --i_frame_model_name cheng2020-anchor \
   --i_frame_quality 6 \
   --lambda_value 2048 \
@@ -1211,10 +1042,10 @@ python DCVC-family/DCVC/train_dcvc.py \
 
 # ========== Stage 3, GOP 7 ==========
 python DCVC-family/DCVC/train_dcvc.py \
-  --vimeo_dir /path/to/vimeo_septuplet/sequences \
-  --septuplet_list /path/to/sep_trainlist.txt \
-  --hevc_b_dir /path/to/HEVC-B/sequences \
+  --train_video_dir /path/to/train/videos \
+  --val_video_dir /path/to/val/videos \
   --checkpoint_dir ./checkpoints \
+  --i_frame_type compressai \
   --i_frame_model_name cheng2020-anchor \
   --i_frame_quality 6 \
   --lambda_value 2048 \
@@ -1236,10 +1067,10 @@ python DCVC-family/DCVC/train_dcvc.py \
 ```bash
 # ========== Stage 4, GOP 2 ==========
 CUDA_VISIBLE_DEVICES=0 accelerate launch DCVC-family/DCVC/train_dcvc.py \
-  --vimeo_dir /path/to/vimeo_septuplet/sequences \
-  --septuplet_list /path/to/sep_trainlist.txt \
-  --hevc_b_dir /path/to/HEVC-B/sequences \
+  --train_video_dir /path/to/train/videos \
+  --val_video_dir /path/to/val/videos \
   --checkpoint_dir ./checkpoints \
+  --i_frame_type compressai \
   --i_frame_model_name cheng2020-anchor \
   --i_frame_quality 6 \
   --lambda_value 2048 \
@@ -1258,10 +1089,10 @@ CUDA_VISIBLE_DEVICES=0 accelerate launch DCVC-family/DCVC/train_dcvc.py \
 
 # ========== Stage 4, GOP 3 ==========
 CUDA_VISIBLE_DEVICES=0 accelerate launch DCVC-family/DCVC/train_dcvc.py \
-  --vimeo_dir /path/to/vimeo_septuplet/sequences \
-  --septuplet_list /path/to/sep_trainlist.txt \
-  --hevc_b_dir /path/to/HEVC-B/sequences \
+  --train_video_dir /path/to/train/videos \
+  --val_video_dir /path/to/val/videos \
   --checkpoint_dir ./checkpoints \
+  --i_frame_type compressai \
   --i_frame_model_name cheng2020-anchor \
   --i_frame_quality 6 \
   --lambda_value 2048 \
@@ -1280,10 +1111,10 @@ CUDA_VISIBLE_DEVICES=0 accelerate launch DCVC-family/DCVC/train_dcvc.py \
 
 # ========== Stage 4, GOP 5 ==========
 CUDA_VISIBLE_DEVICES=0 accelerate launch DCVC-family/DCVC/train_dcvc.py \
-  --vimeo_dir /path/to/vimeo_septuplet/sequences \
-  --septuplet_list /path/to/sep_trainlist.txt \
-  --hevc_b_dir /path/to/HEVC-B/sequences \
+  --train_video_dir /path/to/train/videos \
+  --val_video_dir /path/to/val/videos \
   --checkpoint_dir ./checkpoints \
+  --i_frame_type compressai \
   --i_frame_model_name cheng2020-anchor \
   --i_frame_quality 6 \
   --lambda_value 2048 \
@@ -1302,10 +1133,10 @@ CUDA_VISIBLE_DEVICES=0 accelerate launch DCVC-family/DCVC/train_dcvc.py \
 
 # ========== Stage 4, GOP 7 ==========
 CUDA_VISIBLE_DEVICES=0 accelerate launch DCVC-family/DCVC/train_dcvc.py \
-  --vimeo_dir /path/to/vimeo_septuplet/sequences \
-  --septuplet_list /path/to/sep_trainlist.txt \
-  --hevc_b_dir /path/to/HEVC-B/sequences \
+  --train_video_dir /path/to/train/videos \
+  --val_video_dir /path/to/val/videos \
   --checkpoint_dir ./checkpoints \
+  --i_frame_type compressai \
   --i_frame_model_name cheng2020-anchor \
   --i_frame_quality 6 \
   --lambda_value 2048 \
@@ -1325,10 +1156,10 @@ CUDA_VISIBLE_DEVICES=0 accelerate launch DCVC-family/DCVC/train_dcvc.py \
 # ========== Stage 4, GOP 7 + GOP 优化（可选）==========
 # 在完成 Stage 4 GOP 7 训练后，可以启用 GOP 级别优化进行微调
 CUDA_VISIBLE_DEVICES=0 accelerate launch DCVC-family/DCVC/train_dcvc.py \
-  --vimeo_dir /path/to/vimeo_septuplet/sequences \
-  --septuplet_list /path/to/sep_trainlist.txt \
-  --hevc_b_dir /path/to/HEVC-B/sequences \
+  --train_video_dir /path/to/train/videos \
+  --val_video_dir /path/to/val/videos \
   --checkpoint_dir ./checkpoints \
+  --i_frame_type compressai \
   --i_frame_model_name cheng2020-anchor \
   --i_frame_quality 6 \
   --lambda_value 2048 \
@@ -1351,10 +1182,10 @@ CUDA_VISIBLE_DEVICES=0 accelerate launch DCVC-family/DCVC/train_dcvc.py \
 ```bash
 # ========== Stage 4, GOP 2 ==========
 python DCVC-family/DCVC/train_dcvc.py \
-  --vimeo_dir /path/to/vimeo_septuplet/sequences \
-  --septuplet_list /path/to/sep_trainlist.txt \
-  --hevc_b_dir /path/to/HEVC-B/sequences \
+  --train_video_dir /path/to/train/videos \
+  --val_video_dir /path/to/val/videos \
   --checkpoint_dir ./checkpoints \
+  --i_frame_type compressai \
   --i_frame_model_name cheng2020-anchor \
   --i_frame_quality 6 \
   --lambda_value 2048 \
@@ -1373,10 +1204,10 @@ python DCVC-family/DCVC/train_dcvc.py \
 
 # ========== Stage 4, GOP 3 ==========
 python DCVC-family/DCVC/train_dcvc.py \
-  --vimeo_dir /path/to/vimeo_septuplet/sequences \
-  --septuplet_list /path/to/sep_trainlist.txt \
-  --hevc_b_dir /path/to/HEVC-B/sequences \
+  --train_video_dir /path/to/train/videos \
+  --val_video_dir /path/to/val/videos \
   --checkpoint_dir ./checkpoints \
+  --i_frame_type compressai \
   --i_frame_model_name cheng2020-anchor \
   --i_frame_quality 6 \
   --lambda_value 2048 \
@@ -1395,10 +1226,10 @@ python DCVC-family/DCVC/train_dcvc.py \
 
 # ========== Stage 4, GOP 5 ==========
 python DCVC-family/DCVC/train_dcvc.py \
-  --vimeo_dir /path/to/vimeo_septuplet/sequences \
-  --septuplet_list /path/to/sep_trainlist.txt \
-  --hevc_b_dir /path/to/HEVC-B/sequences \
+  --train_video_dir /path/to/train/videos \
+  --val_video_dir /path/to/val/videos \
   --checkpoint_dir ./checkpoints \
+  --i_frame_type compressai \
   --i_frame_model_name cheng2020-anchor \
   --i_frame_quality 6 \
   --lambda_value 2048 \
@@ -1417,10 +1248,10 @@ python DCVC-family/DCVC/train_dcvc.py \
 
 # ========== Stage 4, GOP 7 ==========
 python DCVC-family/DCVC/train_dcvc.py \
-  --vimeo_dir /path/to/vimeo_septuplet/sequences \
-  --septuplet_list /path/to/sep_trainlist.txt \
-  --hevc_b_dir /path/to/HEVC-B/sequences \
+  --train_video_dir /path/to/train/videos \
+  --val_video_dir /path/to/val/videos \
   --checkpoint_dir ./checkpoints \
+  --i_frame_type compressai \
   --i_frame_model_name cheng2020-anchor \
   --i_frame_quality 6 \
   --lambda_value 2048 \
@@ -1440,10 +1271,10 @@ python DCVC-family/DCVC/train_dcvc.py \
 # ========== Stage 4, GOP 7 + GOP 优化（可选）==========
 # 在完成 Stage 4 GOP 7 训练后，可以启用 GOP 级别优化进行微调
 python DCVC-family/DCVC/train_dcvc.py \
-  --vimeo_dir /path/to/vimeo_septuplet/sequences \
-  --septuplet_list /path/to/sep_trainlist.txt \
-  --hevc_b_dir /path/to/HEVC-B/sequences \
+  --train_video_dir /path/to/train/videos \
+  --val_video_dir /path/to/val/videos \
   --checkpoint_dir ./checkpoints \
+  --i_frame_type compressai \
   --i_frame_model_name cheng2020-anchor \
   --i_frame_quality 6 \
   --lambda_value 2048 \
@@ -1462,49 +1293,7 @@ python DCVC-family/DCVC/train_dcvc.py \
   --resume ./checkpoints/model_dcvc_lambda_2048.0_quality_4_stage_4_latest.pth
 ```
 
-#### Stage 5: BVI-AOM 微调（可选）
-
-**Linux (CUDA)**:
-```bash
-CUDA_VISIBLE_DEVICES=0 accelerate launch DCVC-family/DCVC/train_dcvc.py \
-  --bvi_aom_dir /path/to/BVI-AOM \
-  --hevc_b_dir /path/to/HEVC-B/sequences \
-  --checkpoint_dir ./checkpoints \
-  --i_frame_model_name cheng2020-anchor \
-  --i_frame_quality 6 \
-  --lambda_value 2048 \
-  --quality_index 4 \
-  --stage 5 \
-  --finetune_epochs 10 \
-  --finetune_gop_size 32 \
-  --finetune_batch_size 2 \
-  --finetune_lr 1e-4 \
-  --crop_size 256 \
-  --eval_freq 1 \
-  --num_workers 4 \
-  --resume ./checkpoints/model_dcvc_lambda_2048.0_quality_4_stage_4_best.pth
-```
-
-**macOS (Apple Silicon/Intel)**:
-```bash
-python DCVC-family/DCVC/train_dcvc.py \
-  --bvi_aom_dir /path/to/BVI-AOM \
-  --hevc_b_dir /path/to/HEVC-B/sequences \
-  --checkpoint_dir ./checkpoints \
-  --i_frame_model_name cheng2020-anchor \
-  --i_frame_quality 6 \
-  --lambda_value 2048 \
-  --quality_index 4 \
-  --stage 5 \
-  --finetune_epochs 10 \
-  --finetune_gop_size 32 \
-  --finetune_batch_size 2 \
-  --finetune_lr 1e-4 \
-  --crop_size 256 \
-  --eval_freq 1 \
-  --num_workers 4 \
-  --resume ./checkpoints/model_dcvc_lambda_2048.0_quality_4_stage_4_best.pth
-```
+**注意**：当前版本的 `train_dcvc.py` 仅支持 Stage 1-4，不支持 Stage 5 微调。
 
 ---
 
@@ -1609,45 +1398,48 @@ BPP = -log2(likelihood).sum() / (batch_size * height * width)
 
 | 参数 | 说明 | 示例 |
 |------|------|------|
-| `--vimeo_dir` | Vimeo-90k 数据集路径 | `/path/to/vimeo_septuplet/sequences` |
-| `--septuplet_list` | Vimeo-90k 训练列表文件 | `/path/to/sep_trainlist.txt` |
+| `--train_video_dir` | 训练视频目录路径（MP4 文件） | `/path/to/train/videos` |
 | `--checkpoint_dir` | 检查点保存目录 | `./checkpoints` |
 | `--lambda_value` | 率失真权衡参数 | `2048` (越高质量越好，压缩率越低) |
-| `--quality_index` | 质量索引 (1-8) | `4` |
-| `--stage` | 训练阶段 (1-5) | `1` |
+| `--quality_index` | 质量索引 (1-4) | `4` |
+| `--stage` | 训练阶段 (1-4) | `1` |
 
 ### 数据集参数
 
 | 参数 | 说明 | 默认值 |
 |------|------|--------|
-| `--use_video_dataset` | 使用 MP4 视频数据集（而不是图片序列） | `False` |
-| `--train_video_dir` | 训练视频目录路径（MP4 文件） | `None` |
-| `--val_video_dir` | 验证视频目录路径（MP4 文件） | `None` |
-| `--vimeo_dir` | Vimeo-90k 数据集路径（图片序列） | `None` |
-| `--septuplet_list` | Vimeo-90k 训练列表文件 | `None` |
-| `--hevc_b_dir` | HEVC-B 评估数据集路径（图片序列或视频） | `None` |
-| `--bvi_aom_dir` | BVI-AOM 微调数据集路径 | `None` |
+| `--train_video_dir` | 训练视频目录路径（MP4 文件，必需） | `None` |
+| `--val_video_dir` | 验证视频目录路径（MP4 文件，可选） | `None` |
 | `--crop_size` | 训练时的随机裁剪大小 | `256` |
 | `--num_workers` | 数据加载器工作进程数 | `4` |
 
-**数据集选择逻辑**：
-- 如果指定 `--use_video_dataset`，使用 `--train_video_dir` 和 `--val_video_dir`（MP4 文件）
-- 如果不指定 `--use_video_dataset`，使用 `--vimeo_dir` 和 `--septuplet_list`（图片序列）
+**数据集说明**：
+- 当前版本仅支持 MP4 视频数据集
+- 训练视频目录必须包含 `.mp4` 文件
+- 验证视频目录用于训练过程中的评估（如果提供）
 
 ### I-frame 参数
 
 | 参数 | 说明 | 默认值 |
 |------|------|--------|
-| `--i_frame_model_name` | CompressAI I-frame 模型名称 | `cheng2020-anchor` |
-| `--i_frame_quality` | I-frame 质量等级 (1-8) | `6` |
-| `--i_frame_pretrained` | 使用预训练 I-frame 权重 | `True` |
+| `--i_frame_type` | I-frame 模型类型 (`compressai` 或 `vqgan`) | `compressai` |
+| `--i_frame_model_name` | CompressAI I-frame 模型名称（仅当 `--i_frame_type=compressai` 时使用） | `cheng2020-anchor` |
+| `--i_frame_quality` | I-frame 质量等级 (1-8)（仅当 `--i_frame_type=compressai` 时使用） | `6` |
+| `--i_frame_pretrained` | 使用预训练 I-frame 权重（仅当 `--i_frame_type=compressai` 时使用） | `True` |
+| `--vqgan_config` | VQGAN 配置文件路径（仅当 `--i_frame_type=vqgan` 时使用，必需） | `None` |
+| `--vqgan_checkpoint` | VQGAN 检查点路径（仅当 `--i_frame_type=vqgan` 时使用，必需） | `None` |
 
-**可用的 I-frame 模型**：
+**CompressAI I-frame 模型**（`--i_frame_type=compressai`）：
 - `bmshj2018-factorized`
 - `bmshj2018-hyperprior`
 - `cheng2020-anchor`
 - `cheng2020-attn`
 - 等等（见 CompressAI 文档）
+
+**VQGAN I-frame 模型**（`--i_frame_type=vqgan`）：
+- 需要提供 VQGAN 配置文件和检查点
+- 使用最简单的均匀分布假设计算 BPP
+- 支持与 CompressAI 模型相同的接口
 
 ### 训练超参数
 
@@ -1660,15 +1452,7 @@ BPP = -log2(likelihood).sum() / (batch_size * height * width)
 | `--gop_size` | GOP 大小（帧数） | `7` |
 | `--grad_clip_max_norm` | 梯度裁剪最大范数 | `1.0` |
 
-### Stage 5 微调参数
-
-| 参数 | 说明 | 默认值 |
-|------|------|--------|
-| `--finetune_epochs` | 微调轮数 | `10` |
-| `--finetune_gop_size` | 微调 GOP 大小 | `32` |
-| `--finetune_batch_size` | 微调批次大小 | `2` |
-| `--finetune_lr` | 微调学习率 | `1e-4` |
-| `--finetune_max_sequences` | 最大序列数量限制 | `None` |
+**注意**：当前版本不支持 Stage 5 微调参数。
 
 ### 优化器与调度器
 
@@ -1732,9 +1516,9 @@ BPP = -log2(likelihood).sum() / (batch_size * height * width)
 
 ## 评估与验证
 
-### HEVC-B 评估
+### 视频评估
 
-训练过程中会自动在 HEVC-B 数据集上进行评估（如果提供了 `--hevc_b_dir`）。
+训练过程中会自动在验证视频数据集上进行评估（如果提供了 `--val_video_dir`）。
 
 **评估指标**：
 - **PSNR** (Peak Signal-to-Noise Ratio): 峰值信噪比
@@ -1757,28 +1541,32 @@ BPP = -log2(likelihood).sum() / (batch_size * height * width)
 训练完成后，可以使用独立的评估脚本：
 
 ```bash
-# 完整视频评估（I-frame + P-frames）
+# 完整视频评估（I-frame + P-frames，使用 CompressAI I-frame）
 python DCVC-family/DCVC/test_video.py \
   --p_frame_model_path ./checkpoints/model_dcvc_lambda_2048.0_quality_4_stage_4_best.pth \
-  --hevc_b_dir /path/to/HEVC-B/sequences \
+  --val_video_dir /path/to/val/videos \
   --i_frame_model cheng2020-anchor \
   --i_frame_quality 6 \
   --max_frames 96
 
+# 完整视频评估（使用 VQGAN I-frame）
+# 注意：如果 test_video.py 支持 VQGAN，需要添加相应参数
+# python DCVC-family/DCVC/test_video.py \
+#   --p_frame_model_path ./checkpoints/model_dcvc_lambda_2048.0_quality_4_stage_4_best.pth \
+#   --val_video_dir /path/to/val/videos \
+#   --i_frame_type vqgan \
+#   --vqgan_config /path/to/vqgan_config.json \
+#   --vqgan_checkpoint /path/to/vqgan_checkpoint.pth \
+#   --max_frames 96
+
 # 真实压缩模式（使用实际熵编码，较慢）
 python DCVC-family/DCVC/test_video.py \
   --p_frame_model_path /path/to/checkpoint.pth \
-  --hevc_b_dir /path/to/HEVC-B/sequences \
+  --val_video_dir /path/to/val/videos \
   --i_frame_model cheng2020-anchor \
   --i_frame_quality 6 \
   --max_frames 96 \
   --real_compression
-
-# I-frame 单独评估
-python DCVC-family/DCVC/test_iframe.py \
-  --hevc_b_dir /path/to/HEVC-B/sequences \
-  --i_frame_model cheng2020-anchor \
-  --quality 6
 ```
 
 ---
@@ -1951,30 +1739,36 @@ model_dcvc_lambda_2048.0_quality_4_stage_4_global_best.pth
 
 ### 8. I-frame 模型加载失败
 
-**问题**：无法加载 CompressAI I-frame 模型
+**问题**：无法加载 I-frame 模型（CompressAI 或 VQGAN）
 
 **解决方案**：
+
+**CompressAI 模型**：
 - 检查 CompressAI 是否正确安装
 - 确认模型名称正确（`--i_frame_model_name`）
 - 检查质量等级是否在有效范围内（1-8）
 - 确认网络连接（如果需要下载预训练权重）
+
+**VQGAN 模型**：
+- 检查 `--vqgan_config` 和 `--vqgan_checkpoint` 路径是否正确
+- 确认配置文件格式正确（JSON 格式）
+- 验证检查点文件是否完整且可读
+- 检查 VQGAN 模型依赖是否正确安装
+- 确认 `--i_frame_type vqgan` 参数已指定
 
 ### 9. 数据集路径问题
 
 **问题**：找不到数据集或数据加载错误
 
 **解决方案**：
-- **图片序列数据集**：
-  - 检查数据集路径是否正确
-  - 确认目录结构符合要求
-  - 检查训练列表文件格式
-  - 确认图像文件可以正常读取
 - **视频数据集**：
-  - 检查视频目录路径是否正确
+  - 检查 `--train_video_dir` 路径是否正确（必需）
+  - 检查 `--val_video_dir` 路径是否正确（可选，用于评估）
   - 确认目录中包含 `.mp4` 文件
   - 验证视频文件可以正常打开（使用 `cv2.VideoCapture` 测试）
   - 检查视频格式是否支持（建议使用 MP4）
   - 确认视频分辨率足够（至少 256x256）
+  - 确认视频长度至少包含 GOP 大小的帧数
 
 ### 10. 分布式训练问题
 
@@ -2000,7 +1794,6 @@ Stage 1 (GOP 2→3→5→7)
     → Stage 3 (GOP 2→3→5→7) 
       → Stage 4 (GOP 2→3→5→7) 
         → Stage 4 GOP 优化（可选）
-          → Stage 5 微调（可选）
 ```
 
 ### 2. 学习率管理
@@ -2052,11 +1845,16 @@ Stage 1 (GOP 2→3→5→7)
 
 DCVC 模型的训练是一个复杂但系统化的过程。关键要点：
 
-1. **遵循多阶段训练协议**：按顺序完成 Stage 1-4（可选 Stage 5）
+1. **遵循多阶段训练协议**：按顺序完成 Stage 1-4
 2. **GOP 渐进式训练**：在每个阶段内，GOP 大小从 2 → 3 → 5 → 7 逐步增加
 3. **学习率管理**：切换 GOP 大小时必须重置学习率
 4. **检查点管理**：合理使用检查点，确保训练连续性
 5. **评估与监控**：定期评估模型性能，及时发现问题
+6. **视频数据集**：当前版本仅支持 MP4 视频数据集，使用 `--train_video_dir` 和 `--val_video_dir` 参数
+7. **I-frame 模型选择**：
+   - **CompressAI 模型**（默认）：使用 `--i_frame_type compressai`，配合 `--i_frame_model_name` 和 `--i_frame_quality` 参数
+   - **VQGAN 模型**：使用 `--i_frame_type vqgan`，配合 `--vqgan_config` 和 `--vqgan_checkpoint` 参数（必需）
+   - 两种模型类型完全兼容，可以在训练过程中切换
 
 通过遵循本指南，您应该能够成功训练 DCVC 模型。如果遇到问题，请参考"常见问题与解决方案"部分，或查看项目文档和代码注释。
 

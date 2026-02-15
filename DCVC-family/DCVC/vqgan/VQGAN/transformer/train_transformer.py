@@ -404,33 +404,168 @@ def validate(model, val_loader, device, vocab_size: int):
 # --------------- 5. 主流程 ---------------
 
 
+def load_config(config_path: str) -> dict:
+    """从JSON配置文件加载配置"""
+    if not os.path.exists(config_path):
+        raise FileNotFoundError(f"配置文件不存在: {config_path}")
+    with open(config_path, "r", encoding="utf-8") as f:
+        config = json.load(f)
+    return config
+
+
+def merge_config_with_args(config: dict, args: argparse.Namespace) -> argparse.Namespace:
+    """将配置文件中的参数合并到args中，命令行参数优先（如果命令行参数不是None）"""
+    # 模型参数
+    if "model" in config:
+        model_cfg = config["model"]
+        if args.vocab_size is None:
+            args.vocab_size = model_cfg.get("vocab_size", 1024)
+        if args.d_model is None:
+            args.d_model = model_cfg.get("d_model", 512)
+        if args.num_layers is None:
+            args.num_layers = model_cfg.get("num_layers", 4)
+    
+    # 数据参数
+    if "data" in config:
+        data_cfg = config["data"]
+        if args.seq_len is None:
+            args.seq_len = data_cfg.get("seq_len", 8192)
+        if args.sequence_length is None:
+            args.sequence_length = data_cfg.get("sequence_length", 8)
+        if args.image_size is None:
+            args.image_size = data_cfg.get("image_size", 256)
+        if args.train_data_dir is None or args.train_data_dir == "":
+            args.train_data_dir = data_cfg.get("train_data_dir", "")
+        if args.val_data_dir is None or args.val_data_dir == "":
+            args.val_data_dir = data_cfg.get("val_data_dir", "")
+        if args.train_num_samples is None:
+            args.train_num_samples = data_cfg.get("train_num_samples", None)
+        if args.val_num_samples is None:
+            args.val_num_samples = data_cfg.get("val_num_samples", None)
+    
+    # VQGAN参数
+    if "vqgan" in config:
+        vq_cfg = config["vqgan"]
+        if args.vq_config is None or args.vq_config == "":
+            args.vq_config = vq_cfg.get("vq_config", "")
+        if args.vq_ckpt is None or args.vq_ckpt == "":
+            args.vq_ckpt = vq_cfg.get("vq_ckpt", "")
+    
+    # 训练参数
+    if "training" in config:
+        train_cfg = config["training"]
+        if args.batch_size is None:
+            args.batch_size = train_cfg.get("batch_size", 1)
+        if args.grad_accum_steps is None:
+            args.grad_accum_steps = train_cfg.get("grad_accum_steps", 4)
+        # use_amp 处理：如果命令行未指定（None），则使用配置文件的值
+        if args.use_amp is None:
+            args.use_amp = train_cfg.get("use_amp", False)
+        if args.epochs is None:
+            args.epochs = train_cfg.get("epochs", 100)
+        if args.lr is None:
+            args.lr = train_cfg.get("lr", 1e-4)
+        if args.seed is None:
+            args.seed = train_cfg.get("seed", 42)
+        if args.resume is None:
+            resume_val = train_cfg.get("resume", None)
+            args.resume = resume_val if resume_val else None
+        if args.val_start_epoch is None:
+            args.val_start_epoch = train_cfg.get("val_start_epoch", 2)
+        args.weight_decay = train_cfg.get("weight_decay", 1e-4)
+    
+    # 输出参数
+    if "output" in config:
+        output_cfg = config["output"]
+        if args.output_dir is None:
+            args.output_dir = output_cfg.get("output_dir", "./runs/transformer")
+        if args.recon_output_dir is None or args.recon_output_dir == "":
+            args.recon_output_dir = output_cfg.get("recon_output_dir", "")
+        if args.original_output_dir is None or args.original_output_dir == "":
+            args.original_output_dir = output_cfg.get("original_output_dir", "")
+    
+    # 设备参数
+    if "device" in config:
+        if args.device is None:
+            args.device = config.get("device", "cuda:0")
+    
+    return args
+
+
 def main():
     parser = argparse.ArgumentParser(description="VQGAN index Transformer 压缩训练")
-    parser.add_argument("--vocab_size", type=int, default=1024, help="VQGAN codebook 大小")
-    parser.add_argument("--seq_len", type=int, default=8192, help="序列长度")
-    parser.add_argument("--batch_size", type=int, default=1)
-    parser.add_argument("--grad_accum_steps", type=int, default=4)
-    parser.add_argument("--use_amp", action="store_true")
-    parser.add_argument("--epochs", type=int, default=100)
-    parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--d_model", type=int, default=512)
-    parser.add_argument("--num_layers", type=int, default=4)
+    parser.add_argument("--config", type=str, default="", help="配置文件路径（JSON格式）")
+    parser.add_argument("--vocab_size", type=int, default=None, help="VQGAN codebook 大小")
+    parser.add_argument("--seq_len", type=int, default=None, help="序列长度")
+    parser.add_argument("--batch_size", type=int, default=None)
+    parser.add_argument("--grad_accum_steps", type=int, default=None)
+    parser.add_argument("--use_amp", action="store_true", help="是否使用混合精度训练")
+    parser.add_argument("--no_use_amp", dest="use_amp", action="store_false", help="不使用混合精度训练")
+    parser.set_defaults(use_amp=None)  # 默认None，表示未指定
+    parser.add_argument("--epochs", type=int, default=None)
+    parser.add_argument("--lr", type=float, default=None)
+    parser.add_argument("--d_model", type=int, default=None)
+    parser.add_argument("--num_layers", type=int, default=None)
     parser.add_argument("--train_num_samples", type=int, default=None)
     parser.add_argument("--val_num_samples", type=int, default=None)
-    parser.add_argument("--output_dir", type=str, default="./runs/transformer")
-    parser.add_argument("--device", type=str, default="cuda:0")
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--vq_config", type=str, default="", help="VQGAN 配置路径")
-    parser.add_argument("--vq_ckpt", type=str, default="", help="VQGAN checkpoint 路径")
-    parser.add_argument("--train_data_dir", type=str, default="", help="训练视频目录")
-    parser.add_argument("--val_data_dir", type=str, default="", help="验证视频目录")
-    parser.add_argument("--sequence_length", type=int, default=8, help="每样本帧数")
-    parser.add_argument("--image_size", type=int, default=256)
-    parser.add_argument("--recon_output_dir", type=str, default="", help="验证重构视频输出目录")
-    parser.add_argument("--original_output_dir", type=str, default="", help="验证裁剪原视频输出目录")
+    parser.add_argument("--output_dir", type=str, default=None)
+    parser.add_argument("--device", type=str, default=None)
+    parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--vq_config", type=str, default=None, help="VQGAN 配置路径")
+    parser.add_argument("--vq_ckpt", type=str, default=None, help="VQGAN checkpoint 路径")
+    parser.add_argument("--train_data_dir", type=str, default=None, help="训练视频目录")
+    parser.add_argument("--val_data_dir", type=str, default=None, help="验证视频目录")
+    parser.add_argument("--sequence_length", type=int, default=None, help="每样本帧数")
+    parser.add_argument("--image_size", type=int, default=None)
+    parser.add_argument("--recon_output_dir", type=str, default=None, help="验证重构视频输出目录")
+    parser.add_argument("--original_output_dir", type=str, default=None, help="验证裁剪原视频输出目录")
     parser.add_argument("--resume", type=str, default=None)
-    parser.add_argument("--val_start_epoch", type=int, default=2, help="从该 epoch 开始验证并写 CSV")
+    parser.add_argument("--val_start_epoch", type=int, default=None, help="从该 epoch 开始验证并写 CSV")
     args = parser.parse_args()
+    
+    # 如果指定了配置文件，则加载并合并配置
+    if args.config:
+        config = load_config(args.config)
+        # 合并配置（命令行参数优先）
+        args = merge_config_with_args(config, args)
+        print(f"已从配置文件加载参数: {args.config}")
+    else:
+        # 如果没有指定配置文件，使用默认值
+        defaults = {
+            "vocab_size": 1024,
+            "seq_len": 8192,
+            "batch_size": 1,
+            "grad_accum_steps": 4,
+            "use_amp": False,
+            "epochs": 100,
+            "lr": 1e-4,
+            "d_model": 512,
+            "num_layers": 4,
+            "train_num_samples": None,
+            "val_num_samples": None,
+            "output_dir": "./runs/transformer",
+            "device": "cuda:0",
+            "seed": 42,
+            "vq_config": "",
+            "vq_ckpt": "",
+            "train_data_dir": "",
+            "val_data_dir": "",
+            "sequence_length": 8,
+            "image_size": 256,
+            "recon_output_dir": "",
+            "original_output_dir": "",
+            "resume": None,
+            "val_start_epoch": 2,
+            "weight_decay": 1e-4,
+        }
+        for key, default_val in defaults.items():
+            if key == "use_amp":
+                # use_amp 特殊处理：如果命令行未指定（None），使用默认值
+                if args.use_amp is None:
+                    args.use_amp = default_val
+            else:
+                if not hasattr(args, key) or getattr(args, key) is None:
+                    setattr(args, key, default_val)
 
     set_seed(args.seed)
     output_dir = Path(args.output_dir)
@@ -519,7 +654,8 @@ def main():
     total_params = sum(p.numel() for p in model.parameters())
     print(f"参数量: {total_params:,}")
 
-    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+    weight_decay = getattr(args, "weight_decay", 1e-4)
+    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=weight_decay)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=5)
     start_epoch = 1
     if args.resume and os.path.isfile(args.resume):

@@ -176,7 +176,7 @@ def compress_i_frame_with_padding(i_frame_model, frame_tensor, calculate_bpp=Tru
     因此需要对不满足条件的帧进行填充，压缩后再裁剪回原始尺寸。
     
     Args:
-        i_frame_model: CompressAI 的 I-frame 压缩模型（期望 RGB 输入）
+        i_frame_model: I-frame 压缩模型（CompressAI 或 VQGAN，期望 RGB 输入）
         frame_tensor: 输入 RGB 帧张量，形状 [B, C(=3), H, W]，值域 [0, 1]
         calculate_bpp: 是否计算准确的 BPP（Bits Per Pixel，每像素比特数）
     
@@ -960,12 +960,19 @@ def main():
                         help='Path to training video directory (MP4 files)')
     parser.add_argument('--val_video_dir', type=str, default=None,
                         help='Path to validation video directory (MP4 files)')
+    parser.add_argument('--i_frame_type', type=str, default='compressai',
+                        choices=['compressai', 'vqgan'],
+                        help='I-frame model type: compressai or vqgan')
     parser.add_argument('--i_frame_model_name', type=str, default='cheng2020-anchor', 
                         help='CompressAI I-frame model name (e.g., cheng2020-anchor, bmshj2018-factorized, etc.)')
     parser.add_argument('--i_frame_quality', type=int, default=6, 
                         help='Quality level for CompressAI pretrained model (1-8, higher = better quality)')
     parser.add_argument('--i_frame_pretrained', action='store_true', default=True,
                         help='Use CompressAI pretrained weights for I-frame model')
+    parser.add_argument('--vqgan_config', type=str, default=None,
+                        help='VQGAN config file path (required if i_frame_type=vqgan)')
+    parser.add_argument('--vqgan_checkpoint', type=str, default=None,
+                        help='VQGAN checkpoint path (required if i_frame_type=vqgan)')
     
     
     # Training arguments
@@ -1068,40 +1075,74 @@ def main():
         logger.info(f"GOP optimization: {config['use_gop_optimization']}")
         logger.info("=" * 80)
 
-    # ========== 加载 CompressAI I-frame 模型 ==========
+    # ========== 加载 I-frame 模型 ==========
     # I-frame 模型用于压缩每个 GOP 的第一帧，使用预训练权重，不参与训练
-    if accelerator.is_main_process:
-        logger.info(f"Loading CompressAI I-frame model: {args.i_frame_model_name}")
-        logger.info(f"Quality level: {args.i_frame_quality}")
-        logger.info(f"Using pretrained weights: {args.i_frame_pretrained}")
-    
-    try:
-        # 从 CompressAI 模型库加载预训练模型
-        i_frame_model = compressai_models[args.i_frame_model_name](
-            quality=args.i_frame_quality,        # 质量等级（1-8，越高质量越好）
-            pretrained=args.i_frame_pretrained  # 是否使用预训练权重
-        ).to(device)
-        
-        # 设置为评估模式（不训练，只推理）
-        i_frame_model.eval()
+    # 支持 CompressAI 和 VQGAN 两种模型类型
+    if args.i_frame_type == 'vqgan':
+        # 加载 VQGAN I-frame 模型
+        if not args.vqgan_config or not args.vqgan_checkpoint:
+            error_msg = "--vqgan_config and --vqgan_checkpoint must be provided when using VQGAN I-frame model"
+            if accelerator.is_main_process:
+                logger.error(error_msg)
+            raise ValueError(error_msg)
         
         if accelerator.is_main_process:
-            logger.info(f"Successfully loaded CompressAI model: {args.i_frame_model_name}")
+            logger.info("Loading VQGAN I-frame model")
+            logger.info(f"Config: {args.vqgan_config}")
+            logger.info(f"Checkpoint: {args.vqgan_checkpoint}")
+        
+        try:
+            from src.models.vqgan_iframe import VQGANIFrameModel
+            i_frame_model = VQGANIFrameModel(
+                vq_config_path=args.vqgan_config,
+                vq_checkpoint_path=args.vqgan_checkpoint,
+                device=device
+            )
+            i_frame_model.eval()
             
-    except KeyError:
-        # 模型名称不存在
-        available_models = list(compressai_models.keys())
-        error_msg = f"Model '{args.i_frame_model_name}' not found in CompressAI zoo. Available models: {available_models}"
+            if accelerator.is_main_process:
+                logger.info(f"Successfully loaded VQGAN I-frame model")
+                logger.info(f"Codebook size: {i_frame_model.codebook_size}")
+                
+        except Exception as e:
+            error_msg = f"Error loading VQGAN I-frame model: {e}"
+            if accelerator.is_main_process:
+                logger.error(error_msg)
+            raise RuntimeError(error_msg)
+    else:
+        # 加载 CompressAI I-frame 模型（默认）
         if accelerator.is_main_process:
-            logger.error(error_msg)
-        raise ValueError(error_msg)
+            logger.info(f"Loading CompressAI I-frame model: {args.i_frame_model_name}")
+            logger.info(f"Quality level: {args.i_frame_quality}")
+            logger.info(f"Using pretrained weights: {args.i_frame_pretrained}")
         
-    except Exception as e:
-        # 其他加载错误
-        error_msg = f"Error loading CompressAI model: {e}"
-        if accelerator.is_main_process:
-            logger.error(error_msg)
-        raise RuntimeError(error_msg)
+        try:
+            # 从 CompressAI 模型库加载预训练模型
+            i_frame_model = compressai_models[args.i_frame_model_name](
+                quality=args.i_frame_quality,        # 质量等级（1-8，越高质量越好）
+                pretrained=args.i_frame_pretrained  # 是否使用预训练权重
+            ).to(device)
+            
+            # 设置为评估模式（不训练，只推理）
+            i_frame_model.eval()
+            
+            if accelerator.is_main_process:
+                logger.info(f"Successfully loaded CompressAI model: {args.i_frame_model_name}")
+                
+        except KeyError:
+            # 模型名称不存在
+            available_models = list(compressai_models.keys())
+            error_msg = f"Model '{args.i_frame_model_name}' not found in CompressAI zoo. Available models: {available_models}"
+            if accelerator.is_main_process:
+                logger.error(error_msg)
+            raise ValueError(error_msg)
+            
+        except Exception as e:
+            # 其他加载错误
+            error_msg = f"Error loading CompressAI model: {e}"
+            if accelerator.is_main_process:
+                logger.error(error_msg)
+            raise RuntimeError(error_msg)
     
     # 如果启用编译，使用 torch.compile 加速推理
     if args.compile:

@@ -1,7 +1,7 @@
 {
   "model_type": "TamingVQGAN",
   "model_args": {
-    "model_variant": "VQModel",
+    "model_variant": "EMAVQ",
     "n_embed": 1024,
     "embed_dim": 256,
     "ddconfig": {
@@ -29,8 +29,8 @@
   },
   "data": {
     "use_images": false,
-    "train_dir": "/path/to/train",
-    "val_dir": "",
+    "train_dir": "/root/DCVC-VQGAN/DCVC-family/data",
+    "val_dir": "/root/DCVC-VQGAN/DCVC-family/data",
     "batch_size": 1,
     "num_workers": 4,
     "sequence_length": 8,
@@ -45,7 +45,7 @@
     "save_dir": "./runs/checkpoints",
     "save_interval": 5000,
     "log_interval": 50,
-    "validation_interval": 1000,
+    "validation_interval": 300,
     "best_max_images": 2048,
     "resume_ckpt": null
   },
