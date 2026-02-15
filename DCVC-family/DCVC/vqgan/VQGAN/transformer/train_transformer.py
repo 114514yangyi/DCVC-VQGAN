@@ -1,19 +1,24 @@
 #!/usr/bin/env python3
 """
-VQVAE2 Codebook Index 压缩 - Transformer 训练脚本
+VQGAN Codebook Index 压缩 - Transformer 训练脚本
 
-- 使用 VQVAE2 将训练/验证视频编码为 index（每帧 top+bottom 等层级拼接）
-- Transformer 学习 index 序列的概率分布，用于估算压缩比特率
-- 验证阶段（从第 2 个 epoch 起）生成 CSV：orig, recon, size（size 由 Transformer 概率估算 bytes，不用熵编码）
+- 使用训练集视频经 VQGAN 编码得到 index，训练 Transformer 学习 index 分布以压缩存储。
+- 验证集：VQGAN 生成 index 的同时生成重构视频并保存；验证阶段（从第 2 个 epoch 起）生成 CSV，
+  表中压缩大小由 Transformer 输出概率估算（bits = -log2(p)，bytes = bits/8），不使用熵编码实际压缩。
 """
 
-import os
-import sys
-import json
-import random
 import argparse
+import csv
+import json
+import os
+import random
+import sys
+from collections import defaultdict
 from pathlib import Path
 
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
@@ -21,17 +26,14 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 
-_VQVAE2_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-if _VQVAE2_ROOT not in sys.path:
-    sys.path.insert(0, _VQVAE2_ROOT)
+_VQGAN_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if _VQGAN_ROOT not in sys.path:
+    sys.path.insert(0, _VQGAN_ROOT)
 
-# 本地 data_prepare / recon_judge
 from transformer import data_prepare
-from transformer import recon_judge
+
+LN2 = 0.6931471805599453
 
 
 def set_seed(seed=42):
@@ -44,7 +46,37 @@ def set_seed(seed=42):
     torch.backends.cudnn.benchmark = False
 
 
-# ============== Transformer 模型（与 project 一致，不依赖 CompressAI）==============
+# --------------- 1. Dataset ---------------
+
+
+class VQIndexDataset(Dataset):
+    """VQGAN codebook index 数据集，data 形状 [N, seq_len] int64。"""
+    def __init__(self, data: np.ndarray):
+        self.data = np.asarray(data, dtype=np.int64)
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        return torch.from_numpy(self.data[idx]).long()
+
+
+class ValIndexDataset(Dataset):
+    """验证集：返回 (indices, meta)，便于评估时按样本写 CSV（概率估算 bytes）。"""
+    def __init__(self, data: np.ndarray, meta: list):
+        self.data = np.asarray(data, dtype=np.int64)
+        self.meta = list(meta)
+        assert len(self.data) == len(self.meta)
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        return torch.from_numpy(self.data[idx]).long(), self.meta[idx]
+
+
+# --------------- 2. Transformer 概率模型（RoPE + Decoder-only）-------------------
+
 
 class MultiheadAttention(nn.Module):
     def __init__(self, embed_size, heads):
@@ -64,9 +96,8 @@ class MultiheadAttention(nn.Module):
         theta = torch.pow(10000, -2 * ids / output_dim)
         embeddings = position * theta
         embeddings = torch.stack([torch.sin(embeddings), torch.cos(embeddings)], dim=-1)
-        embeddings = embeddings.unsqueeze(0).unsqueeze(0).expand(batch_size, nums_head, -1, -1)
-        embeddings = embeddings.reshape(batch_size, nums_head, max_len, output_dim)
-        return embeddings
+        embeddings = embeddings.repeat((batch_size, nums_head, *([1] * len(embeddings.shape))))
+        return embeddings.reshape(batch_size, nums_head, max_len, output_dim)
 
     def RoPE(self, q, k):
         B, H, L, D = q.shape
@@ -123,15 +154,17 @@ class DecoderLayer(nn.Module):
 
 
 class TransformerProbabilityModel(nn.Module):
-    def __init__(self, num_codes=512, max_seq_len=8192, d_model=256, nhead=8, num_layers=6, dropout=0, ff_hidden_dim=None):
+    """Decoder-only Transformer + RoPE，BOS=num_codes，输出 num_codes 维概率。"""
+    def __init__(self, num_codes=1024, max_seq_len=16384, d_model=256, nhead=8, num_layers=6,
+                 dropout=0, ff_hidden_dim=None):
         super().__init__()
-        if ff_hidden_dim is None:
-            ff_hidden_dim = d_model * 3
         self.bos_token_id = num_codes
         self.num_codes = num_codes
         self.vocab_size = num_codes + 1
         self.max_seq_len = max_seq_len + 1
         self.d_model = d_model
+        if ff_hidden_dim is None:
+            ff_hidden_dim = d_model * 3
         self.embedding = nn.Embedding(self.vocab_size, d_model)
         self.decoder_blocks = nn.ModuleList(
             [DecoderLayer(d_model, nhead, ff_hidden_dim, dropout) for _ in range(num_layers)]
@@ -148,8 +181,8 @@ class TransformerProbabilityModel(nn.Module):
         x_emb = self.embedding(x)
         if mask is None:
             mask = torch.triu(torch.ones(seq_len, seq_len, device=x.device), diagonal=1)
-        for dec in self.decoder_blocks:
-            x_emb = dec(x_emb, mask, use_rope=use_rope)
+        for block in self.decoder_blocks:
+            x_emb = block(x_emb, mask, use_rope=use_rope)
         logits = self.fc_out(x_emb) / temperature
         probabilities = F.softmax(logits, dim=-1)
         return logits, probabilities
@@ -157,18 +190,18 @@ class TransformerProbabilityModel(nn.Module):
     def get_conditional_probs(self, context_indices, temperature=1.0, use_rope=True):
         if context_indices.dim() == 1:
             context_indices = context_indices.unsqueeze(0)
-        seq_len = context_indices.size(1)
+        _, seq_len = context_indices.shape
         mask = torch.triu(torch.ones(seq_len, seq_len, device=context_indices.device), diagonal=1)
         logits, probs = self.forward(context_indices, mask=mask, temperature=temperature, use_rope=use_rope)
         probs = probs[:, -1, :]
-        if probs.size(0) == 1:
+        if probs.shape[0] == 1:
             probs = probs.squeeze(0)
         return probs
 
 
 class TransformerEntropyModel(nn.Module):
-    """包装 Transformer，forward 返回 (rate, probs)，rate 由 NLL 转 bits."""
-    def __init__(self, num_codes=512, max_seq_len=8192, d_model=256, num_layers=6, nhead=8):
+    """包装 Transformer 概率模型，forward 返回 (rate, probs)，率由 NLL 转 bits。"""
+    def __init__(self, num_codes=1024, max_seq_len=16384, d_model=256, num_layers=6, nhead=8):
         super().__init__()
         self.transformer = TransformerProbabilityModel(
             num_codes=num_codes, max_seq_len=max_seq_len, d_model=d_model,
@@ -184,55 +217,134 @@ class TransformerEntropyModel(nn.Module):
         batch_size, seq_len = indices.shape
         mask = torch.triu(torch.ones(seq_len, seq_len, device=indices.device), diagonal=1)
         logits, probs = self.transformer(indices, mask=mask, use_rope=True)
-        input_logits = logits[:, :-1, :].contiguous()
-        target_indices = indices[:, 1:].contiguous()
-        logits_flat = input_logits.view(-1, logits.size(-1))
-        indices_flat = target_indices.view(-1)
-        nll = F.cross_entropy(logits_flat, indices_flat, reduction="mean")
-        rate = nll / 0.6931471805599453
+        input_logits = logits[:, :-1, :].contiguous().view(-1, logits.size(-1))
+        target_indices = indices[:, 1:].contiguous().view(-1)
+        nll = F.cross_entropy(input_logits, target_indices, reduction="mean")
+        rate = nll / LN2
         if return_probs:
             return rate, probs
         return rate
 
 
-# ============== 数据集 ==============
-
-class VQIndexDataset(Dataset):
-    def __init__(self, data: np.ndarray):
-        self.data = data
-
-    def __len__(self):
-        return len(self.data)
-
-    def __getitem__(self, idx):
-        return torch.from_numpy(self.data[idx]).long()
+# --------------- 3. 基于概率估算压缩大小（不用熵编码）---------------
 
 
-# ============== 训练 / 验证 / 压缩率估算 ==============
+def estimate_bits_from_probs(probs: torch.Tensor, indices: torch.Tensor, eps: float = 1e-10) -> torch.Tensor:
+    """
+    probs: [B, seq_len, num_codes], indices: [B, seq_len] 或 [B, seq_len+1]（含 BOS）。
+    若 probs 对应预测位置 0..seq_len-1，则 indices 应为目标 [d0..d_{L-1}]，即 indices 与 probs 对齐：
+    probs[b,t] 预测的是 indices[b,t]。
+    返回每个样本的总 bits（标量或 per-sample）。
+    """
+    if indices.shape[1] == probs.shape[1] + 1:
+        indices = indices[:, 1:]
+    assert probs.shape[:2] == indices.shape[:2]
+    indices_flat = indices.long().clamp(0, probs.size(-1) - 1)
+    p = torch.gather(probs, dim=-1, index=indices_flat.unsqueeze(-1)).squeeze(-1)
+    nll_bits = -torch.log2(p.clamp(min=eps))
+    return nll_bits.sum(dim=1)
 
-def train_epoch(model, loader, optimizer, device, epoch, grad_accum_steps=1, use_amp=False):
+
+def evaluate_compression_rate_by_probs(model, dataloader, device, vocab_size: int):
+    """
+    用 Transformer 输出概率估算压缩率，不做实际熵编码。
+    返回: (avg_bits_per_index, compression_ratio, fixed_bits_per_index)
+    """
+    model.eval()
+    fixed_bits = np.log2(vocab_size)
+    total_bits = 0.0
+    total_indices = 0
+    with torch.no_grad():
+        for batch in dataloader:
+            if isinstance(batch, (list, tuple)):
+                indices = batch[0].to(device)
+            else:
+                indices = batch.to(device)
+            B, L = indices.shape
+            bos = torch.full((B, 1), model.bos_token_id, dtype=torch.long, device=device)
+            full = torch.cat([bos, indices], dim=1)
+            mask = torch.triu(torch.ones(L + 1, L + 1, device=device), diagonal=1)
+            _, probs = model.transformer(full, mask=mask, use_rope=True)
+            probs = probs[:, :-1, :]
+            bits_per_sample = estimate_bits_from_probs(probs, indices)
+            total_bits += bits_per_sample.sum().item()
+            total_indices += B * L
+    if total_indices == 0:
+        return fixed_bits, 1.0, fixed_bits
+    avg_bits = total_bits / total_indices
+    ratio = fixed_bits / avg_bits if avg_bits > 0 else 1.0
+    return avg_bits, ratio, fixed_bits
+
+
+def evaluate_and_write_csv(
+    model,
+    val_loader: DataLoader,
+    device,
+    csv_path: str,
+    vocab_size: int,
+):
+    """
+    按验证集逐样本用 Transformer 概率估算压缩 bytes，按 (original_path, recon_path) 聚合后写 CSV。
+    表头: orig, recon, size（size 为估算的 bytes，不经过熵编码实际压缩）。
+    """
+    model.eval()
+    agg = defaultdict(lambda: 0.0)
+    with torch.no_grad():
+        for batch in tqdm(val_loader, desc="估算压缩大小并写 CSV"):
+            indices, meta_batch = batch
+            indices = indices.to(device)
+            B, L = indices.shape
+            bos = torch.full((B, 1), model.bos_token_id, dtype=torch.long, device=device)
+            full = torch.cat([bos, indices], dim=1)
+            mask = torch.triu(torch.ones(L + 1, L + 1, device=device), diagonal=1)
+            _, probs = model.transformer(full, mask=mask, use_rope=True)
+            probs = probs[:, :-1, :]
+            bits_per_sample = estimate_bits_from_probs(probs, indices)
+            for i in range(B):
+                if isinstance(meta_batch, dict):
+                    m = {k: (v[i] if hasattr(v, "__getitem__") else v) for k, v in meta_batch.items()}
+                else:
+                    m = meta_batch[i] if isinstance(meta_batch, (list, tuple)) else meta_batch
+                orig = m.get("original_path") or m.get("orig", "")
+                recon = m.get("recon_path") or m.get("recon", "")
+                bits = bits_per_sample[i].item()
+                bytes_est = max(0, int(np.ceil(bits / 8.0)))
+                key = (orig, recon)
+                agg[key] += bytes_est
+    os.makedirs(os.path.dirname(csv_path) or ".", exist_ok=True)
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["orig", "recon", "size"])
+        for (orig, recon), size in sorted(agg.items()):
+            w.writerow([orig, recon, size])
+    print(f"CSV 已写入: {csv_path}（size 为 Transformer 概率估算 bytes）")
+
+
+# --------------- 4. 训练与验证 ---------------
+
+
+def train_epoch(model, train_loader, optimizer, device, epoch, grad_accum_steps=1, use_amp=False):
     model.train()
     total_loss = total_rate = total_acc = 0.0
     num_batches = 0
     scaler = torch.cuda.amp.GradScaler() if use_amp else None
     optimizer.zero_grad()
-    pbar = tqdm(loader, desc=f"Epoch {epoch:03d} [train]")
+    pbar = tqdm(train_loader, desc=f"Epoch {epoch:03d} [训练]")
     for batch_idx, indices in enumerate(pbar):
         indices = indices.to(device, non_blocking=True)
-        bos = model.transformer.bos_token_id
-        bos_col = torch.full((indices.size(0), 1), bos, dtype=torch.long, device=device)
-        full = torch.cat([bos_col, indices], dim=1)
+        B, L = indices.shape
+        bos = torch.full((B, 1), model.bos_token_id, dtype=torch.long, device=device)
+        full = torch.cat([bos, indices], dim=1)
         input_seq = full[:, :-1]
         target_seq = full[:, 1:]
-        seq_len = input_seq.size(1)
-        mask = torch.triu(torch.ones(seq_len, seq_len, device=device), diagonal=1)
+        mask = torch.triu(torch.ones(L, L, device=device), diagonal=1)
         with torch.amp.autocast(device_type="cuda", enabled=use_amp):
             logits, probs = model.transformer(input_seq, mask=mask, use_rope=True)
             logits_flat = logits.reshape(-1, logits.size(-1))
             target_flat = target_seq.reshape(-1)
             nll = F.cross_entropy(logits_flat, target_flat, reduction="mean")
-            rate = nll / 0.6931471805599453
-            preds = torch.argmax(logits, dim=-1)
+            rate = nll / LN2
+            preds = logits.argmax(dim=-1)
             acc = (preds == target_seq).float().mean()
             loss = rate / grad_accum_steps
         if use_amp:
@@ -242,11 +354,11 @@ def train_epoch(model, loader, optimizer, device, epoch, grad_accum_steps=1, use
         if (batch_idx + 1) % grad_accum_steps == 0:
             if use_amp:
                 scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 scaler.step(optimizer)
                 scaler.update()
             else:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
             optimizer.zero_grad()
         total_loss += loss.item() * grad_accum_steps
@@ -257,143 +369,146 @@ def train_epoch(model, loader, optimizer, device, epoch, grad_accum_steps=1, use
     return total_loss / num_batches, total_rate / num_batches, total_acc / num_batches
 
 
-def validate(model, loader, device):
+def validate(model, val_loader, device, vocab_size: int):
+    """验证：返回 (avg_loss, avg_rate, avg_acc)。"""
     model.eval()
     total_loss = total_rate = total_acc = 0.0
     num_batches = 0
     with torch.no_grad():
-        for indices in tqdm(loader, desc="[val]"):
-            indices = indices.to(device)
-            bos = model.transformer.bos_token_id
-            bos_col = torch.full((indices.size(0), 1), bos, dtype=torch.long, device=device)
-            full = torch.cat([bos_col, indices], dim=1)
+        for batch in tqdm(val_loader, desc="[验证]"):
+            if isinstance(batch, (list, tuple)):
+                indices = batch[0].to(device)
+            else:
+                indices = batch.to(device)
+            B, L = indices.shape
+            bos = torch.full((B, 1), model.bos_token_id, dtype=torch.long, device=device)
+            full = torch.cat([bos, indices], dim=1)
             input_seq = full[:, :-1]
             target_seq = full[:, 1:]
-            seq_len = input_seq.size(1)
-            mask = torch.triu(torch.ones(seq_len, seq_len, device=device), diagonal=1)
+            mask = torch.triu(torch.ones(L, L, device=device), diagonal=1)
             logits, probs = model.transformer(input_seq, mask=mask, use_rope=True)
             logits_flat = logits.reshape(-1, logits.size(-1))
             target_flat = target_seq.reshape(-1)
             nll = F.cross_entropy(logits_flat, target_flat, reduction="mean")
-            rate = nll / 0.6931471805599453
-            preds = torch.argmax(logits, dim=-1)
+            rate = nll / LN2
+            preds = logits.argmax(dim=-1)
             acc = (preds == target_seq).float().mean()
             total_loss += rate.item()
             total_rate += rate.item()
             total_acc += acc.item()
             num_batches += 1
-    return total_loss / num_batches, total_rate / num_batches, total_acc / num_batches
+    n = max(num_batches, 1)
+    return total_loss / n, total_rate / n, total_acc / n
 
 
-def evaluate_compression_rate(model, loader, device, vocab_size):
-    """
-    用 Transformer 概率估算平均 bits/index（不调用熵编码器）。
-    返回 (avg_bits, compression_ratio, fixed_bits)。
-    """
-    model.eval()
-    total_bits = 0.0
-    total_indices = 0
-    bos_id = model.transformer.bos_token_id
-    with torch.no_grad():
-        for indices in loader:
-            indices = indices.to(device)
-            bos_col = torch.full((indices.size(0), 1), bos_id, dtype=torch.long, device=device)
-            full = torch.cat([bos_col, indices], dim=1)
-            input_seq = full[:, :-1]
-            seq_len = input_seq.size(1)
-            mask = torch.triu(torch.ones(seq_len, seq_len, device=device), diagonal=1)
-            _, probs = model.transformer(input_seq, mask=mask, use_rope=True)
-            # probs (B, seq_len, num_codes) 对应预测 indices
-            target = indices
-            p = torch.gather(probs, 2, target.unsqueeze(-1)).squeeze(-1)
-            eps = 1e-10
-            bits = (-torch.log2(p + eps)).sum().item()
-            total_bits += bits
-            total_indices += indices.numel()
-    avg_bits = total_bits / total_indices if total_indices else 0.0
-    fixed_bits = np.log2(vocab_size)
-    compression_ratio = fixed_bits / avg_bits if avg_bits > 0 else 0.0
-    return avg_bits, compression_ratio, fixed_bits
+# --------------- 5. 主流程 ---------------
 
 
 def main():
-    parser = argparse.ArgumentParser(description="VQVAE2 Index Transformer 训练")
-    parser.add_argument("--train_data_dir", type=str, required=True, help="训练视频目录")
-    parser.add_argument("--val_data_dir", type=str, required=True, help="验证视频目录")
-    parser.add_argument("--vq_config", type=str, default=None, help="VQVAE2 配置，默认 VQVAE2/config.json")
-    parser.add_argument("--vq_ckpt", type=str, required=True, help="VQVAE2 checkpoint")
-    parser.add_argument("--sequence_length", type=int, default=8, help="每段帧数")
-    parser.add_argument("--image_size", type=int, default=256)
-    parser.add_argument("--vocab_size", type=int, default=512, help="codebook 大小，需与 VQVAE2 nb_entries 一致")
-    parser.add_argument("--seq_len", type=int, default=None, help="由数据自动得到时可省略")
-    parser.add_argument("--batch_size", type=int, default=2)
+    parser = argparse.ArgumentParser(description="VQGAN index Transformer 压缩训练")
+    parser.add_argument("--vocab_size", type=int, default=1024, help="VQGAN codebook 大小")
+    parser.add_argument("--seq_len", type=int, default=8192, help="序列长度")
+    parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--grad_accum_steps", type=int, default=4)
     parser.add_argument("--use_amp", action="store_true")
-    parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--d_model", type=int, default=256)
-    parser.add_argument("--num_layers", type=int, default=6)
+    parser.add_argument("--d_model", type=int, default=512)
+    parser.add_argument("--num_layers", type=int, default=4)
     parser.add_argument("--train_num_samples", type=int, default=None)
     parser.add_argument("--val_num_samples", type=int, default=None)
-    parser.add_argument("--max_train_size", type=int, default=10000)
-    parser.add_argument("--output_dir", type=str, default="./outputs")
-    parser.add_argument("--recon_output_dir", type=str, default=None, help="验证重构视频目录，默认 output_dir/recon")
-    parser.add_argument("--original_output_dir", type=str, default=None, help="验证原视频裁剪目录，默认 output_dir/original")
+    parser.add_argument("--output_dir", type=str, default="./runs/transformer")
     parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--vq_config", type=str, default="", help="VQGAN 配置路径")
+    parser.add_argument("--vq_ckpt", type=str, default="", help="VQGAN checkpoint 路径")
+    parser.add_argument("--train_data_dir", type=str, default="", help="训练视频目录")
+    parser.add_argument("--val_data_dir", type=str, default="", help="验证视频目录")
+    parser.add_argument("--sequence_length", type=int, default=8, help="每样本帧数")
+    parser.add_argument("--image_size", type=int, default=256)
+    parser.add_argument("--recon_output_dir", type=str, default="", help="验证重构视频输出目录")
+    parser.add_argument("--original_output_dir", type=str, default="", help="验证裁剪原视频输出目录")
     parser.add_argument("--resume", type=str, default=None)
+    parser.add_argument("--val_start_epoch", type=int, default=2, help="从该 epoch 开始验证并写 CSV")
     args = parser.parse_args()
 
     set_seed(args.seed)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    recon_dir = args.recon_output_dir or str(output_dir / "recon")
-    orig_dir = args.original_output_dir or str(output_dir / "original")
-
-    if args.vq_config is None:
-        args.vq_config = os.path.join(_VQVAE2_ROOT, "config.json")
-
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
-    print("使用设备:", device)
+    print("设备:", device)
+
+    vq_config = args.vq_config or os.getenv("VQ_CONFIG", "")
+    vq_ckpt = args.vq_ckpt or os.getenv("VQ_CKPT", "")
+    if not vq_config or not vq_ckpt:
+        raise ValueError("请提供 --vq_config / --vq_ckpt 或设置 VQ_CONFIG / VQ_CKPT")
+    if not args.train_data_dir:
+        raise ValueError("请提供 --train_data_dir")
 
     # 训练集 index 数据
-    print("加载训练集 index...")
+    print("生成训练集 index 数据...")
     train_data = data_prepare.get_data_injection(
         data_dir=args.train_data_dir,
         seq_len=args.seq_len,
-        vq_config=args.vq_config,
-        vq_ckpt=args.vq_ckpt,
+        vq_config=vq_config,
+        vq_ckpt=vq_ckpt,
         sequence_length=args.sequence_length,
         image_size=args.image_size,
         device=args.device,
         num_samples=args.train_num_samples,
-        max_size=args.max_train_size,
     )
-    seq_len = train_data.shape[1]
-    if args.seq_len is not None and args.seq_len != seq_len:
-        print(f"警告: 数据 seq_len={seq_len} 与 --seq_len={args.seq_len} 不一致，以数据为准")
-    args.seq_len = seq_len
-
-    # 验证集：带重构与 meta（用于 CSV）
-    print("准备验证集（编码 + 重构 + meta）...")
-    val_data, val_meta_list = data_prepare.prepare_validation_with_recon(
-        val_video_dir=args.val_data_dir,
-        vq_config=args.vq_config,
-        vq_ckpt=args.vq_ckpt,
-        sequence_length=args.sequence_length,
-        image_size=args.image_size,
-        device=args.device,
-        recon_output_dir=recon_dir,
-        original_output_dir=orig_dir,
-        max_val_videos=args.val_num_samples,
-    )
+    if train_data.size == 0:
+        raise ValueError("训练集为空")
+    actual_seq_len = train_data.shape[1]
+    if args.seq_len != actual_seq_len:
+        print(f"使用实际 seq_len={actual_seq_len}（与 --seq_len {args.seq_len} 不同则已忽略）")
+    seq_len = actual_seq_len
 
     train_dataset = VQIndexDataset(train_data)
-    val_dataset = VQIndexDataset(val_data)
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=0, pin_memory=False)
-    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=0, pin_memory=False)
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=0,
+        pin_memory=False,
+    )
 
-    print(f"训练样本: {len(train_dataset)}, 验证样本(段): {len(val_dataset)}, seq_len={seq_len}, vocab_size={args.vocab_size}")
+    # 验证集：带重构视频与 meta
+    val_dataset = None
+    val_loader = None
+    val_meta = []
+    if args.val_data_dir:
+        recon_dir = args.recon_output_dir or str(output_dir / "recon")
+        orig_dir = args.original_output_dir or str(output_dir / "original")
+        print("生成验证集 index 与重构视频...")
+        val_data, val_meta = data_prepare.process_val_videos_to_indices_and_recon(
+            video_dir=args.val_data_dir,
+            vq_config=vq_config,
+            vq_ckpt=vq_ckpt,
+            sequence_length=args.sequence_length,
+            image_size=args.image_size,
+            device=args.device,
+            recon_output_dir=recon_dir,
+            original_output_dir=orig_dir,
+            num_samples=args.val_num_samples,
+        )
+        def _collate_val(batch):
+            indices = torch.stack([b[0] for b in batch])
+            metas = [b[1] for b in batch]
+            return indices, metas
+
+        val_dataset = ValIndexDataset(val_data, val_meta)
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=1,
+            shuffle=False,
+            num_workers=0,
+            pin_memory=False,
+            collate_fn=_collate_val,
+        )
+        print(f"验证集样本数: {len(val_dataset)}")
+    else:
+        print("未提供 --val_data_dir，仅训练不验证/不写 CSV")
 
     model = TransformerEntropyModel(
         num_codes=args.vocab_size,
@@ -402,11 +517,10 @@ def main():
         num_layers=args.num_layers,
     ).to(device)
     total_params = sum(p.numel() for p in model.parameters())
-    print(f"模型参数量: {total_params}")
+    print(f"参数量: {total_params:,}")
 
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=5)
-
     start_epoch = 1
     if args.resume and os.path.isfile(args.resume):
         ckpt = torch.load(args.resume, map_location=device, weights_only=False)
@@ -415,93 +529,94 @@ def main():
         else:
             model.load_state_dict(ckpt)
         start_epoch = ckpt.get("epoch", 0) + 1
-        print(f"从 {args.resume} 恢复，epoch {start_epoch}")
+        print(f"从 epoch {start_epoch} 恢复")
 
+    train_history = {"loss": [], "rate": [], "acc": [], "val_loss": [], "val_rate": [], "val_acc": []}
     best_val_rate = float("inf")
     best_model_path = output_dir / "best_model.pth"
-    train_history = {"loss": [], "rate": [], "acc": [], "val_loss": [], "val_rate": [], "val_acc": []}
+    fixed_bits = np.log2(args.vocab_size)
 
     for epoch in range(start_epoch, args.epochs + 1):
         train_loss, train_rate, train_acc = train_epoch(
             model, train_loader, optimizer, device, epoch,
             grad_accum_steps=args.grad_accum_steps, use_amp=args.use_amp,
         )
-        val_loss, val_rate, val_acc = validate(model, val_loader, device)
-        scheduler.step(val_loss)
-
         train_history["loss"].append(train_loss)
         train_history["rate"].append(train_rate)
         train_history["acc"].append(train_acc)
-        train_history["val_loss"].append(val_loss)
-        train_history["val_rate"].append(val_rate)
-        train_history["val_acc"].append(val_acc)
-        print(f"Epoch {epoch}  train loss={train_loss:.4f} rate={train_rate:.4f} acc={train_acc:.4f}  val rate={val_rate:.4f} acc={val_acc:.4f}")
 
-        if val_rate <= best_val_rate:
-            best_val_rate = val_rate
-            torch.save({
-                "epoch": epoch,
-                "model_state_dict": model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "val_rate": val_rate,
-                "train_history": train_history,
-                "args": vars(args),
-            }, best_model_path)
-            print(f"  保存最佳模型 (val_rate={val_rate:.4f})")
+        if val_loader is not None:
+            val_loss, val_rate, val_acc = validate(model, val_loader, device, args.vocab_size)
+            train_history["val_loss"].append(val_loss)
+            train_history["val_rate"].append(val_rate)
+            train_history["val_acc"].append(val_acc)
+            scheduler.step(val_loss)
+            print(f"Epoch {epoch} 训练 loss={train_loss:.4f} rate={train_rate:.4f} acc={train_acc:.4f}")
+            print(f"        验证 loss={val_loss:.4f} rate={val_rate:.4f} acc={val_acc:.4f}")
 
-        # 从第 2 个 epoch 开始，验证时生成 CSV（orig, recon, size 用 Transformer 概率估算）
-        if epoch >= 2 and val_meta_list:
-            csv_path = recon_judge.run_validation_csv(
-                model, val_meta_list, device, str(output_dir),
-                csv_name=f"video_comparison_epoch{epoch}.csv",
-            )
-            print(f"  生成 CSV: {csv_path}")
+            if val_rate <= best_val_rate:
+                best_val_rate = val_rate
+                torch.save({
+                    "epoch": epoch,
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "val_rate": val_rate,
+                    "train_history": train_history,
+                    "args": vars(args),
+                }, best_model_path)
+                print(f"  保存最佳模型 (val_rate={val_rate:.4f})")
 
-    # 最终评估：用概率估算压缩率
-    model.load_state_dict(torch.load(best_model_path, map_location=device, weights_only=False)["model_state_dict"])
-    avg_bits, compression_ratio, fixed_bits = evaluate_compression_rate(model, val_loader, device, args.vocab_size)
-    print("最终评估（概率估算）:")
-    print(f"  平均 bits/index: {avg_bits:.4f}, 固定长度: {fixed_bits:.4f}, 压缩比: {compression_ratio:.2f}:1")
+            if epoch >= args.val_start_epoch:
+                csv_path = output_dir / f"video_comparison_epoch{epoch}.csv"
+                evaluate_and_write_csv(model, val_loader, device, str(csv_path), args.vocab_size)
+        else:
+            scheduler.step(train_loss)
+            print(f"Epoch {epoch} 训练 loss={train_loss:.4f} rate={train_rate:.4f} acc={train_acc:.4f}")
 
-    # 训练曲线
+    if val_loader is not None and best_model_path.exists():
+        ckpt = torch.load(best_model_path, map_location=device, weights_only=False)
+        model.load_state_dict(ckpt["model_state_dict"])
+        avg_bits, ratio, _ = evaluate_compression_rate_by_probs(model, val_loader, device, args.vocab_size)
+        print("最终评估（概率估算）:")
+        print(f"  平均 bits/index: {avg_bits:.4f}, 固定: {fixed_bits:.4f}, 压缩比: {ratio:.2f}:1")
+        if val_meta:
+            csv_final = output_dir / "video_comparison.csv"
+            evaluate_and_write_csv(model, val_loader, device, str(csv_final), args.vocab_size)
+
     plt.figure(figsize=(15, 5))
     plt.subplot(1, 3, 1)
-    plt.plot(train_history["loss"], label="train")
-    plt.plot(train_history["val_loss"], label="val")
+    plt.plot(train_history["loss"], label="训练损失")
+    if train_history["val_loss"]:
+        plt.plot(train_history["val_loss"], label="验证损失")
     plt.legend()
-    plt.title("Loss")
+    plt.xlabel("Epoch")
     plt.subplot(1, 3, 2)
-    plt.plot(train_history["rate"], label="train")
-    plt.plot(train_history["val_rate"], label="val")
-    plt.axhline(y=fixed_bits, color="r", linestyle="--", label=f"fixed {fixed_bits:.2f}")
+    plt.plot(train_history["rate"], label="训练率")
+    if train_history["val_rate"]:
+        plt.plot(train_history["val_rate"], label="验证率")
+    plt.axhline(y=fixed_bits, color="r", linestyle="--", label=f"固定 {fixed_bits:.2f} bits")
     plt.legend()
-    plt.title("Rate (bits/index)")
+    plt.xlabel("Epoch")
     plt.subplot(1, 3, 3)
-    plt.plot(train_history["acc"], label="train")
-    plt.plot(train_history["val_acc"], label="val")
+    plt.plot(train_history["acc"], label="训练准确率")
+    if train_history["val_acc"]:
+        plt.plot(train_history["val_acc"], label="验证准确率")
     plt.legend()
-    plt.title("Accuracy")
+    plt.xlabel("Epoch")
     plt.tight_layout()
     plt.savefig(output_dir / "training_curves.png", dpi=150)
     plt.close()
+    print("训练曲线已保存:", output_dir / "training_curves.png")
 
-    torch.save({
-        "model_state_dict": model.state_dict(),
-        "args": vars(args),
-        "train_history": train_history,
-        "avg_bits_per_index": avg_bits,
-        "compression_ratio": compression_ratio,
-        "fixed_bits_per_index": fixed_bits,
-    }, output_dir / "final_model.pth")
+    config = {
+        "vocab_size": args.vocab_size,
+        "seq_len": seq_len,
+        "d_model": args.d_model,
+        "num_layers": args.num_layers,
+        "model_params": total_params,
+    }
     with open(output_dir / "config.json", "w") as f:
-        json.dump({
-            "vocab_size": args.vocab_size,
-            "seq_len": seq_len,
-            "d_model": args.d_model,
-            "num_layers": args.num_layers,
-            "avg_bits_per_index": avg_bits,
-            "compression_ratio": compression_ratio,
-        }, f, indent=2)
+        json.dump(config, f, indent=2)
     print("训练完成. 输出目录:", output_dir)
 
 

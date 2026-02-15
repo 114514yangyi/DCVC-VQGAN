@@ -1,1 +1,1 @@
-# VQVAE2 Transformer 子包：index 压缩训练与验证评估
+# VQGAN Transformer 压缩模块
