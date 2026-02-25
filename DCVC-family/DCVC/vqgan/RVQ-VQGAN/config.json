@@ -1,0 +1,62 @@
+{
+  "model_type": "TamingVQGAN",
+  "model_args": {
+    "model_variant": "EMAVQ",
+    "n_embed": 1024,
+    "embed_dim": 256,
+    "rvq_levels": 4,
+    "ddconfig": {
+      "double_z": false,
+      "z_channels": 256,
+      "resolution": 256,
+      "in_channels": 3,
+      "out_ch": 3,
+      "ch": 128,
+      "ch_mult": [1, 1, 2, 2, 4],
+      "num_res_blocks": 2,
+      "attn_resolutions": [16],
+      "dropout": 0.0
+    },
+    "lossconfig": {
+      "target": "models.taming.modules.losses.vqperceptual.VQLPIPSWithDiscriminator",
+      "params": {
+        "disc_conditional": false,
+        "disc_in_channels": 3,
+        "disc_start": 10000,
+        "disc_weight": 0.8,
+        "codebook_weight": 1.0
+      }
+    }
+  },
+  "data": {
+    "use_images": false,
+    "train_dir": "/root/DCVC-VQGAN/DCVC-family/data",
+    "val_dir": "/root/DCVC-VQGAN/DCVC-family/data",
+    "batch_size": 1,
+    "num_workers": 4,
+    "sequence_length": 8,
+    "resolution": 256,
+    "seed": 2025
+  },
+  "train": {
+    "device": "cuda",
+    "num_steps": 50000,
+    "lr": 0.0001,
+    "log_dir": "./runs/logs",
+    "save_dir": "./runs/checkpoints",
+    "save_interval": 5000,
+    "log_interval": 50,
+    "validation_interval": 300,
+    "best_max_images": 2048,
+    "resume_ckpt": null
+  },
+  "wandb": {
+    "enabled": false,
+    "project": "vqgan",
+    "name": null,
+    "entity": null,
+    "log_interval": 50,
+    "image_interval": 500
+  }
+}
+
