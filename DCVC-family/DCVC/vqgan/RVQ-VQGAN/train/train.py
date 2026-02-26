@@ -44,6 +44,7 @@ class TrainConfig:
     device: str
     num_steps: int
     lr: float
+    disc_lr: float
     log_dir: str
     save_dir: str
     save_interval: int
@@ -51,6 +52,7 @@ class TrainConfig:
     validation_interval: int
     best_max_images: int
     resume_ckpt: Optional[str]
+    grad_accum_steps: int
 
 
 @dataclass(frozen=True)
@@ -74,6 +76,7 @@ def _parse_train(cfg: Dict[str, Any]) -> TrainConfig:
         device=t.get("device", "cuda" if torch.cuda.is_available() else "cpu"),
         num_steps=int(t["num_steps"]),
         lr=float(t.get("lr", 1e-4)),
+        disc_lr=float(t.get("disc_lr", t.get("lr", 1e-4))),
         log_dir=str(t["log_dir"]),
         save_dir=str(t["save_dir"]),
         save_interval=int(t.get("save_interval", 10000)),
@@ -81,6 +84,7 @@ def _parse_train(cfg: Dict[str, Any]) -> TrainConfig:
         validation_interval=int(t.get("validation_interval", 0)),
         best_max_images=int(t.get("best_max_images", 2048)),
         resume_ckpt=t.get("resume_ckpt", None),
+        grad_accum_steps=int(t.get("grad_accum_steps", 1)),
     )
 
 
@@ -149,10 +153,22 @@ def evaluate(
     metrics_eval = MetricsEvaluator(device=device)
     metrics_eval.reset_fid()
 
+    # 尝试探测是否为多层 RVQ（ResidualEMAVectorQuantizer）
+    taming_model = model._get_model() if hasattr(model, "_get_model") else model  # type: ignore[attr-defined]
+    quantizer = getattr(taming_model, "quantize", None)
+    rvq_depth = int(getattr(quantizer, "num_quantizers", 1)) if quantizer is not None else 1
+    # 每两层记录一次，如 D=4 -> 记录 d=2,4；D=6 -> 2,4,6
+    rvq_depths = [d for d in range(2, rvq_depth + 1, 2)] if rvq_depth > 1 else []
+
     n_seen = 0
     mse_sum = 0.0
     n_mse = 0
     lpips_vals = []
+
+    # 按 depth 聚合 RVQ 的指标
+    rvq_mse_sum = {d: 0.0 for d in rvq_depths}
+    rvq_n_mse = {d: 0 for d in rvq_depths}
+    rvq_lpips_vals = {d: [] for d in rvq_depths}
 
     for batch in val_loader:
         x_u8 = batch.to(device=device, dtype=torch.float32)  # (B,D,H,W,C)
@@ -185,6 +201,49 @@ def evaluate(
         if "lpips" in fid_lpips:
             lpips_vals.append(float(fid_lpips["lpips"]))
 
+        # ====== 额外：针对 RVQ 每两层的指标（例如只用前 2 层、前 4 层） ======
+        if rvq_depths:
+            # 使用底层 taming 模型的 encode 拿到多层 code indices
+            try:
+                quant_full, _emb_loss, info = taming_model.encode(x_in)
+            except Exception:
+                info = None
+
+            if info is not None and len(info) >= 3:
+                indices = info[2]
+                # 只在 indices 为 [B, D, H, W] 时计算分层指标
+                if isinstance(indices, torch.Tensor) and indices.ndim == 4:
+                    for d_depth in rvq_depths:
+                        if d_depth > indices.shape[1]:
+                            continue
+                        partial_idx = indices[:, :d_depth, :, :]  # [B, d, H, W]
+                        try:
+                            quant_d = taming_model.quantize.embed_code(partial_idx)
+                            x_rec_d = taming_model.decode(quant_d)
+                        except Exception:
+                            continue
+
+                        x_rec_d_01 = (x_rec_d * 0.5 + 0.5).clamp(0.0, 1.0)
+                        # MSE / PSNR
+                        mse_d = torch.mean((x_rec_d_01 - x_01) ** 2)
+                        rvq_mse_sum[d_depth] += float(mse_d.item()) * n_batch
+                        rvq_n_mse[d_depth] += n_batch
+
+                        # LPIPS（若可用）
+                        if metrics_eval.lpips_metric is not None:
+                            orig_lp = x_01 * 2.0 - 1.0
+                            rec_lp = x_rec_d_01 * 2.0 - 1.0
+                            lp_batch = []
+                            for i in range(orig_lp.shape[0]):
+                                lp = metrics_eval.lpips_metric(
+                                    orig_lp[i : i + 1], rec_lp[i : i + 1]
+                                )
+                                lp_batch.append(float(lp.item()))
+                            if lp_batch:
+                                rvq_lpips_vals[d_depth].append(
+                                    sum(lp_batch) / len(lp_batch)
+                                )
+
         n_seen += n_batch
 
     avg_mse = mse_sum / max(n_mse, 1)
@@ -193,7 +252,30 @@ def evaluate(
     lpips = sum(lpips_vals) / len(lpips_vals) if lpips_vals else float("nan")
 
     model.train()
-    return {"val/psnr": psnr, "val/fid": fid, "val/lpips": lpips, "val/mse": avg_mse, "val/n_images": n_seen}
+    results: Dict[str, Any] = {
+        "val/psnr": psnr,
+        "val/fid": fid,
+        "val/lpips": lpips,
+        "val/mse": avg_mse,
+        "val/n_images": n_seen,
+    }
+
+    # 汇总并写入每两层 RVQ 的指标
+    for d_depth in rvq_depths:
+        if rvq_n_mse[d_depth] <= 0:
+            continue
+        avg_mse_d = rvq_mse_sum[d_depth] / rvq_n_mse[d_depth]
+        psnr_d = MetricsEvaluator.psnr_from_mse(torch.tensor(avg_mse_d, device=device))
+        lpips_d = (
+            sum(rvq_lpips_vals[d_depth]) / len(rvq_lpips_vals[d_depth])
+            if rvq_lpips_vals[d_depth]
+            else float("nan")
+        )
+        results[f"val/psnr_rvq_d{d_depth}"] = psnr_d
+        results[f"val/lpips_rvq_d{d_depth}"] = lpips_d
+        results[f"val/mse_rvq_d{d_depth}"] = avg_mse_d
+
+    return results
 
 
 def main():
@@ -227,6 +309,10 @@ def main():
     optimizers, _schedulers = taming_model.configure_optimizers()
     opt_ae = optimizers[0]
     opt_disc = optimizers[1] if isinstance(optimizers, (list, tuple)) and len(optimizers) > 1 else None
+    # 允许在 config 中单独设置判别器学习率
+    if opt_disc is not None:
+        for pg in opt_disc.param_groups:
+            pg["lr"] = float(train_cfg.disc_lr)
 
     # normalize: [0,1] -> [-1,1]
     normalize = Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
@@ -263,6 +349,10 @@ def main():
 
     data_iter = iter(train_loader)
 
+    # 累计梯度相关设置
+    grad_accum_steps = max(1, int(train_cfg.grad_accum_steps))
+    step_offset = start_step
+
     for step in range(start_step, train_cfg.num_steps):
         try:
             batch = next(data_iter)
@@ -290,9 +380,11 @@ def main():
             cond=None,
             split="train",
         )
-        opt_ae.zero_grad(set_to_none=True)
-        loss_ae.backward()
-        opt_ae.step()
+        # 累计梯度：按 grad_accum_steps 归一化 loss 并延迟 step
+        loss_ae_scaled = loss_ae / grad_accum_steps
+        if (step - step_offset) % grad_accum_steps == 0:
+            opt_ae.zero_grad(set_to_none=True)
+        loss_ae_scaled.backward()
 
         loss_disc = torch.tensor(0.0, device=device)
         if opt_disc is not None:
@@ -306,11 +398,19 @@ def main():
                 cond=None,
                 split="train",
             )
-            opt_disc.zero_grad(set_to_none=True)
-            loss_disc.backward()
-            opt_disc.step()
+            loss_disc_scaled = loss_disc / grad_accum_steps
+            if (step - step_offset) % grad_accum_steps == 0:
+                opt_disc.zero_grad(set_to_none=True)
+            loss_disc_scaled.backward()
         else:
             log_disc = {}
+
+        # 在累计到指定步数时再执行优化器 step
+        if (step - step_offset + 1) % grad_accum_steps == 0:
+            torch.nn.utils.clip_grad_norm_(taming_model.parameters(), max_norm=1.0)
+            opt_ae.step()
+            if opt_disc is not None:
+                opt_disc.step()
 
         if step % train_cfg.log_interval == 0:
             rec_loss = log_ae.get("train/rec_loss", None)
@@ -343,7 +443,10 @@ def main():
             xrec_01 = (x_rec * 0.5 + 0.5).clamp(0, 1)
             n_show = min(4, x_01.shape[0])
             grid = make_grid(torch.cat([xrec_01[:n_show], x_01[:n_show]], dim=0), nrow=n_show)
-            wb_run.log({"viz/recon_top_orig_bottom": wb_run.Image(grid.permute(1, 2, 0).cpu().numpy())}, step=step)
+            # Run 对象没有 Image 属性，这里应使用 wandb.Image
+            import wandb as _wandb  # 局部引用以避免未启用 wandb 时出错
+            img = _wandb.Image(grid.permute(1, 2, 0).cpu().numpy())
+            wb_run.log({"viz/recon_top_orig_bottom": img}, step=step)
 
         if train_cfg.save_interval > 0 and step > 0 and step % train_cfg.save_interval == 0:
             ckpt_path = _save_checkpoint(train_cfg.save_dir, step, model, opt_ae, opt_disc, cfg)
@@ -367,6 +470,18 @@ def main():
                     f"val @ step {step} | psnr={val_metrics['val/psnr']:.4f} "
                     f"fid={val_metrics['val/fid']:.4f} lpips={val_metrics['val/lpips']:.6f}"
                 )
+                # 如存在 RVQ 分层指标，一并打印（例如：只用前 2/4 层量化时的 PSNR / LPIPS）
+                rvq_keys = sorted(
+                    [k for k in val_metrics.keys() if k.startswith("val/psnr_rvq_d")]
+                )
+                for k in rvq_keys:
+                    d_str = k.split("d")[-1]
+                    psnr_d = val_metrics.get(k, float("nan"))
+                    lpips_k = f"val/lpips_rvq_d{d_str}"
+                    lpips_d = val_metrics.get(lpips_k, float("nan"))
+                    logger.info(
+                        f"  rvq depth {d_str}: psnr={psnr_d:.4f}, lpips={lpips_d:.6f}"
+                    )
                 if wb_run is not None:
                     wb_run.log(val_metrics, step=step)
 

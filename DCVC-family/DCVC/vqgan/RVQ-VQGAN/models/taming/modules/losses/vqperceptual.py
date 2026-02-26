@@ -16,8 +16,21 @@ class DummyLoss(nn.Module):
 
 
 def adopt_weight(weight, global_step, threshold=0, value=0.):
+    """
+    根据训练步数自适应调整权重:
+    - global_step < threshold: 完全关闭，返回 value（通常为 0）
+    - threshold <= global_step < 2*threshold: 线性从 0 -> weight
+        factor = (global_step - threshold) / threshold
+        实现用户需求的 min(1, (step-disc_start)/disc_start)
+    - global_step >= 2*threshold: 使用完整权重 weight
+    """
     if global_step < threshold:
-        weight = value
+        return value
+    # 在 [threshold, 2*threshold) 范围内做线性缩放
+    if global_step < 2 * threshold and threshold > 0:
+        factor = float(global_step - threshold) / float(threshold)
+        factor = max(0.0, min(1.0, factor))
+        return weight * factor
     return weight
 
 
