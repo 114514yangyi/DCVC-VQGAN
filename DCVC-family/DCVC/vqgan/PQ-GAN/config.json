@@ -1,10 +1,12 @@
 {
   "model_type": "TamingVQGAN",
   "model_args": {
-    "model_variant": "EMAVQ",
-    "n_embed": 16384,
-    "embed_dim": 1024,
-    "rvq_levels": 8,
+    "model_variant": "PQEMAVQ",
+    "n_embed": 128,
+    "embed_dim": 256,
+    "pq_num_subspaces": 64,
+    "pq_decay": 0.99,
+    "pq_eps": 1e-5,
     "ddconfig": {
       "double_z": false,
       "z_channels": 256,
@@ -12,7 +14,7 @@
       "in_channels": 3,
       "out_ch": 3,
       "ch": 128,
-      "ch_mult": [1, 1, 2, 2, 4],
+      "ch_mult": [1, 1, 2, 2, 2],
       "num_res_blocks": 2,
       "attn_resolutions": [16],
       "dropout": 0.0
@@ -31,7 +33,7 @@
   "data": {
     "use_images": true,
     "train_dir": "/data/huyang/data/train_distribute",
-    "val_dir": "/data/huyang/data/vaild_distribute",
+    "val_dir": "/data/huyang/data/vaild",
     "batch_size": 1,
     "num_workers": 4,
     "sequence_length": 16,
@@ -39,10 +41,10 @@
     "seed": 2025
   },
   "train": {
-    "device": "cuda:2",
+    "device": "cuda:4",
     "num_steps": 300000,
-  "lr": 0.0001,
-  "disc_lr": 0.0001,
+    "lr": 4.5e-6,
+    "disc_lr": 4.5e-6,
     "log_dir": "./runs/logs",
     "save_dir": "./runs/checkpoints",
     "save_interval": 5000,
@@ -55,7 +57,7 @@
   "wandb": {
     "enabled": true,
     "project": "rqvae",
-    "name": "rqvae",
+    "name": "pqgan",
     "entity": null,
     "log_interval": 50,
     "image_interval": 500
