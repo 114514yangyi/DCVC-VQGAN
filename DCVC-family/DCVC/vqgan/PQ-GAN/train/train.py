@@ -44,6 +44,7 @@ class TrainConfig:
     device: str
     num_steps: int
     lr: float
+    disc_lr: float
     log_dir: str
     save_dir: str
     save_interval: int
@@ -51,6 +52,7 @@ class TrainConfig:
     validation_interval: int
     best_max_images: int
     resume_ckpt: Optional[str]
+    grad_accum_steps: int
 
 
 @dataclass(frozen=True)
@@ -74,6 +76,7 @@ def _parse_train(cfg: Dict[str, Any]) -> TrainConfig:
         device=t.get("device", "cuda" if torch.cuda.is_available() else "cpu"),
         num_steps=int(t["num_steps"]),
         lr=float(t.get("lr", 1e-4)),
+        disc_lr=float(t.get("disc_lr", t.get("lr", 1e-4))),
         log_dir=str(t["log_dir"]),
         save_dir=str(t["save_dir"]),
         save_interval=int(t.get("save_interval", 10000)),
@@ -81,6 +84,7 @@ def _parse_train(cfg: Dict[str, Any]) -> TrainConfig:
         validation_interval=int(t.get("validation_interval", 0)),
         best_max_images=int(t.get("best_max_images", 2048)),
         resume_ckpt=t.get("resume_ckpt", None),
+        grad_accum_steps=int(t.get("grad_accum_steps", 1)),
     )
 
 
@@ -227,6 +231,10 @@ def main():
     optimizers, _schedulers = taming_model.configure_optimizers()
     opt_ae = optimizers[0]
     opt_disc = optimizers[1] if isinstance(optimizers, (list, tuple)) and len(optimizers) > 1 else None
+    # 允许在 config 中单独设置判别器学习率
+    if opt_disc is not None:
+        for pg in opt_disc.param_groups:
+            pg["lr"] = float(train_cfg.disc_lr)
 
     # normalize: [0,1] -> [-1,1]
     normalize = Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
@@ -263,6 +271,10 @@ def main():
 
     data_iter = iter(train_loader)
 
+    # 累计梯度设置
+    grad_accum_steps = max(1, int(train_cfg.grad_accum_steps))
+    step_offset = start_step
+
     for step in range(start_step, train_cfg.num_steps):
         try:
             batch = next(data_iter)
@@ -290,9 +302,11 @@ def main():
             cond=None,
             split="train",
         )
-        opt_ae.zero_grad(set_to_none=True)
-        loss_ae.backward()
-        opt_ae.step()
+        # 累计梯度：按 grad_accum_steps 归一化 loss，并延迟 step
+        loss_ae_scaled = loss_ae / grad_accum_steps
+        if (step - step_offset) % grad_accum_steps == 0:
+            opt_ae.zero_grad(set_to_none=True)
+        loss_ae_scaled.backward()
 
         loss_disc = torch.tensor(0.0, device=device)
         if opt_disc is not None:
@@ -306,11 +320,19 @@ def main():
                 cond=None,
                 split="train",
             )
-            opt_disc.zero_grad(set_to_none=True)
-            loss_disc.backward()
-            opt_disc.step()
+            loss_disc_scaled = loss_disc / grad_accum_steps
+            if (step - step_offset) % grad_accum_steps == 0:
+                opt_disc.zero_grad(set_to_none=True)
+            loss_disc_scaled.backward()
         else:
             log_disc = {}
+
+        # 在累计到指定步数时再执行优化器 step，并做梯度裁剪
+        if (step - step_offset + 1) % grad_accum_steps == 0:
+            torch.nn.utils.clip_grad_norm_(taming_model.parameters(), max_norm=1.0)
+            opt_ae.step()
+            if opt_disc is not None:
+                opt_disc.step()
 
         if step % train_cfg.log_interval == 0:
             rec_loss = log_ae.get("train/rec_loss", None)
@@ -343,7 +365,10 @@ def main():
             xrec_01 = (x_rec * 0.5 + 0.5).clamp(0, 1)
             n_show = min(4, x_01.shape[0])
             grid = make_grid(torch.cat([xrec_01[:n_show], x_01[:n_show]], dim=0), nrow=n_show)
-            wb_run.log({"viz/recon_top_orig_bottom": wb_run.Image(grid.permute(1, 2, 0).cpu().numpy())}, step=step)
+            # Run 对象没有 Image 属性，这里应使用 wandb.Image
+            import wandb as _wandb  # 局部导入，避免未启用 wandb 时出错
+            img = _wandb.Image(grid.permute(1, 2, 0).cpu().numpy())
+            wb_run.log({"viz/recon_top_orig_bottom": img}, step=step)
 
         if train_cfg.save_interval > 0 and step > 0 and step % train_cfg.save_interval == 0:
             ckpt_path = _save_checkpoint(train_cfg.save_dir, step, model, opt_ae, opt_disc, cfg)

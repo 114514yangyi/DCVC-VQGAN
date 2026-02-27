@@ -16,7 +16,7 @@
       "ch": 128,
       "ch_mult": [1, 1, 2, 2, 2],
       "num_res_blocks": 2,
-      "attn_resolutions": [16],
+      "attn_resolutions": [32],
       "dropout": 0.0
     },
     "lossconfig": {
@@ -36,7 +36,7 @@
     "val_dir": "/data/huyang/data/vaild",
     "batch_size": 1,
     "num_workers": 4,
-    "sequence_length": 16,
+    "sequence_length": 8,
     "resolution": 256,
     "seed": 2025
   },
@@ -45,8 +45,8 @@
     "num_steps": 300000,
     "lr": 4.5e-6,
     "disc_lr": 4.5e-6,
-    "log_dir": "./runs/logs",
-    "save_dir": "./runs/checkpoints",
+    "log_dir": "/data/huyang/new_test/PQGAN/runs/logs",
+    "save_dir": "/data/huyang/new_test/PQGAN/runs/checkpoints",
     "save_interval": 5000,
     "log_interval": 50,
     "validation_interval": 5000,
@@ -63,4 +63,3 @@
     "image_interval": 500
   }
 }
-

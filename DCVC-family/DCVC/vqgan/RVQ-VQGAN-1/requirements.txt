@@ -1,0 +1,12 @@
+torch
+torchvision
+einops
+opencv-python
+numpy
+pytorch-lightning
+omegaconf
+requests
+tqdm
+torchmetrics
+wandb
+

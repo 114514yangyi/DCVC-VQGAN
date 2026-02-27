@@ -34,10 +34,11 @@ class BaseVqVaeAdapter(nn.Module):
 
     def __init__(self, model: nn.Module):
         super().__init__()
-        object.__setattr__(self, "_model", model)
+        # 必须注册为子模块，否则 state_dict() 为空，无法正确保存/恢复 checkpoint
+        self._model = model
 
     def _get_model(self) -> nn.Module:
-        return object.__getattribute__(self, "_model")
+        return self._model
 
     def forward(
         self, x: torch.Tensor
@@ -48,11 +49,6 @@ class BaseVqVaeAdapter(nn.Module):
         if name.startswith("_"):
             raise AttributeError(name)
         return getattr(self._get_model(), name)
-
-    def to(self, device):
-        m = object.__getattribute__(self, "_model")
-        object.__setattr__(self, "_model", m.to(device))
-        return self
 
 
 class TamingVQGANAdapter(BaseVqVaeAdapter):
