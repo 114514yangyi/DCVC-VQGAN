@@ -4,7 +4,7 @@ VQGAN - taming-vqgan 最小训练脚本
 训练逻辑（最小闭环）：
 - 从 config.json 读取参数
 - 构建数据加载器（视频或图片序列）
-- model_adapter.create_model() 创建 taming-vqgan 模型适配器
+- 直接实例化 taming-vqgan 模型（不使用 model_adapter 包装层）
 - 每步：
   - 前向得到 vq_loss + recon
   - 使用 taming 的 loss（VQLPIPSWithDiscriminator）分别计算 ae / disc loss
@@ -35,7 +35,6 @@ if _VQGAN_ROOT not in sys.path:
 
 from data.datasets import DataConfig, build_loaders  # noqa: E402
 from log_utils.log_utils import build_logger  # noqa: E402
-from models.model_adapter import create_model  # noqa: E402
 from metric_utils.metric_utils import MetricsEvaluator  # noqa: E402
 
 
@@ -114,6 +113,76 @@ def _parse_wandb(cfg: Dict[str, Any]) -> WandbConfig:
     )
 
 
+def _build_taming_model(cfg: Dict[str, Any], train_cfg: TrainConfig):
+    """
+    直接根据 config.json 的 model_args 构建 taming 的 VQGAN 模型。
+
+    说明：
+    - 不使用 model_adapter，避免包装层导致的 state_dict 保存/恢复异常。
+    - 训练循环使用 encode/decode 获取 (x_rec, vq_loss, indices)。
+    """
+    from models.taming.models.vqgan import EMAVQ, VQModel  # noqa: E402
+
+    model_args = dict(cfg.get("model_args", {}) or {})
+    model_variant = str(model_args.get("model_variant", "VQModel"))
+
+    ddconfig = model_args["ddconfig"]
+    lossconfig = model_args.get("lossconfig", None)
+    n_embed = int(model_args["n_embed"])
+    embed_dim = int(model_args["embed_dim"])
+
+    # RVQ 深度（Residual Quantization levels）
+    num_quantizers = int(model_args.get("rvq_levels", model_args.get("num_quantizers", 1)))
+    use_residual_rq = bool(model_args.get("use_residual_rq", True))
+
+    if lossconfig is None:
+        lossconfig = {
+            "target": "models.taming.modules.losses.vqperceptual.VQLPIPSWithDiscriminator",
+            "params": {
+                "disc_conditional": False,
+                "disc_in_channels": ddconfig.get("in_channels", 3),
+                "disc_start": 10000,
+                "disc_weight": 0.8,
+                "codebook_weight": 1.0,
+            },
+        }
+
+    if model_variant == "EMAVQ":
+        taming_model = EMAVQ(
+            ddconfig=ddconfig,
+            lossconfig=lossconfig,
+            n_embed=n_embed,
+            embed_dim=embed_dim,
+            ckpt_path=None,
+            ignore_keys=[],
+            image_key="image",
+            colorize_nlabels=None,
+            monitor=None,
+            remap=None,
+            sane_index_shape=False,
+            num_quantizers=num_quantizers,
+            use_residual_rq=use_residual_rq,
+        )
+    else:
+        taming_model = VQModel(
+            ddconfig=ddconfig,
+            lossconfig=lossconfig,
+            n_embed=n_embed,
+            embed_dim=embed_dim,
+            ckpt_path=None,
+            ignore_keys=[],
+            image_key="image",
+            colorize_nlabels=None,
+            monitor=None,
+            remap=None,
+            sane_index_shape=False,
+        )
+
+    taming_model.automatic_optimization = False
+    taming_model.learning_rate = float(train_cfg.lr)
+    return taming_model
+
+
 def _save_checkpoint(
     save_dir: str,
     step: int,
@@ -140,7 +209,7 @@ def _save_checkpoint(
 
 @torch.no_grad()
 def evaluate(
-    model,
+    taming_model,
     val_loader,
     device: torch.device,
     normalize: Normalize,
@@ -149,12 +218,11 @@ def evaluate(
     if val_loader is None:
         return {}
 
-    model.eval()
+    taming_model.eval()
     metrics_eval = MetricsEvaluator(device=device)
     metrics_eval.reset_fid()
 
     # 尝试探测是否为多层 RVQ（ResidualEMAVectorQuantizer）
-    taming_model = model._get_model() if hasattr(model, "_get_model") else model  # type: ignore[attr-defined]
     quantizer = getattr(taming_model, "quantize", None)
     rvq_depth = int(getattr(quantizer, "num_quantizers", 1)) if quantizer is not None else 1
     # 每两层记录一次，如 D=4 -> 记录 d=2,4；D=6 -> 2,4,6
@@ -187,7 +255,8 @@ def evaluate(
         x_01 = rearrange(x_u8, "b d h w c -> (b d) c h w") / 255.0  # [0,1]
         x_in = normalize(x_01)  # [-1,1]
 
-        vq_loss, x_rec, _perp, _idx = model(x_in)
+        quant, vq_loss, _info = taming_model.encode(x_in)
+        x_rec = taming_model.decode(quant)
 
         # recon/orig 都用 [0,1] 计算指标
         x_rec_01 = (x_rec * 0.5 + 0.5).clamp(0.0, 1.0)
@@ -251,7 +320,7 @@ def evaluate(
     fid = metrics_eval.compute_fid_final()
     lpips = sum(lpips_vals) / len(lpips_vals) if lpips_vals else float("nan")
 
-    model.train()
+    taming_model.train()
     results: Dict[str, Any] = {
         "val/psnr": psnr,
         "val/fid": fid,
@@ -299,13 +368,12 @@ def main():
         f"use_images={data_cfg.use_images}, batch_size={data_cfg.batch_size}, seq={data_cfg.sequence_length}, res={data_cfg.resolution}"
     )
 
-    # 创建模型（适配器）
-    model = create_model(config_path=args.config, model_args=cfg.get("model_args", {}))
+    # 直接创建 taming 模型（不使用适配器）
+    taming_model = _build_taming_model(cfg, train_cfg)
     device = torch.device(train_cfg.device)
-    model = model.to(device)
+    taming_model = taming_model.to(device)
 
     # taming 优化器（来自 configure_optimizers）
-    taming_model = model._get_model() if hasattr(model, "_get_model") else model  # type: ignore[attr-defined]
     optimizers, _schedulers = taming_model.configure_optimizers()
     opt_ae = optimizers[0]
     opt_disc = optimizers[1] if isinstance(optimizers, (list, tuple)) and len(optimizers) > 1 else None
@@ -341,7 +409,7 @@ def main():
                 "checkpoint 的 ckpt['model'] 为空 dict：这通常意味着保存时 model.state_dict() 为空（适配器未注册子模块）。"
                 "这种 ckpt 无法恢复模型权重，只能从头训练。建议使用修复后的代码重新训练并保存新 ckpt。"
             )
-        model.load_state_dict(ckpt["model"])
+        taming_model.load_state_dict(ckpt["model"])
         opt_ae.load_state_dict(ckpt["opt_ae"])
         if opt_disc is not None and ckpt.get("opt_disc") is not None:
             opt_disc.load_state_dict(ckpt["opt_disc"])
@@ -371,7 +439,8 @@ def main():
         x = rearrange(x, "b d h w c -> (b d) c h w")
         x = normalize(x / 255.0)
 
-        vq_loss, x_rec, _perp, _idx = model(x)
+        quant, vq_loss, _info = taming_model.encode(x)
+        x_rec = taming_model.decode(quant)
 
         # taming loss (ae)
         last_layer = taming_model.get_last_layer()
@@ -454,7 +523,7 @@ def main():
             wb_run.log({"viz/recon_top_orig_bottom": img}, step=step)
 
         if train_cfg.save_interval > 0 and step > 0 and step % train_cfg.save_interval == 0:
-            ckpt_path = _save_checkpoint(train_cfg.save_dir, step, model, opt_ae, opt_disc, cfg)
+            ckpt_path = _save_checkpoint(train_cfg.save_dir, step, taming_model, opt_ae, opt_disc, cfg)
             logger.info(f"saved: {ckpt_path}")
 
         if (
@@ -464,7 +533,7 @@ def main():
             and step % train_cfg.validation_interval == 0
         ):
             val_metrics = evaluate(
-                model=model,
+                taming_model=taming_model,
                 val_loader=val_loader,
                 device=device,
                 normalize=normalize,
@@ -495,7 +564,7 @@ def main():
                     path = _save_checkpoint(
                         train_cfg.save_dir,
                         step,
-                        model,
+                        taming_model,
                         opt_ae,
                         opt_disc,
                         cfg,
@@ -509,7 +578,7 @@ def main():
                     path = _save_checkpoint(
                         train_cfg.save_dir,
                         step,
-                        model,
+                        taming_model,
                         opt_ae,
                         opt_disc,
                         cfg,
@@ -523,7 +592,7 @@ def main():
                     path = _save_checkpoint(
                         train_cfg.save_dir,
                         step,
-                        model,
+                        taming_model,
                         opt_ae,
                         opt_disc,
                         cfg,
@@ -532,7 +601,7 @@ def main():
                     )
                     logger.info(f"saved best lpips: {path}")
 
-    ckpt_path = _save_checkpoint(train_cfg.save_dir, train_cfg.num_steps, model, opt_ae, opt_disc, cfg)
+    ckpt_path = _save_checkpoint(train_cfg.save_dir, train_cfg.num_steps, taming_model, opt_ae, opt_disc, cfg)
     logger.info(f"done. saved final: {ckpt_path}")
 
     if wb_run is not None:
