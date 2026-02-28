@@ -4,7 +4,7 @@
       "model_variant": "EMAVQ",
       "n_embed": 16384,
       "embed_dim": 512,
-      "rvq_levels": 8,
+      "rvq_levels": 4,
       "ddconfig": {
         "double_z": false,
         "z_channels": 256,

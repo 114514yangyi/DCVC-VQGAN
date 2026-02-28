@@ -1,0 +1,38 @@
+{
+  "train_video_dir": "/root/DCVC-VQGAN/DCVC-family/data",
+  "val_video_dir": "/root/DCVC-VQGAN/DCVC-family/data",
+  
+  "vqgan_config": "/root/DCVC-VQGAN/DCVC-family/DCVC/vqgan/RVQ-VQGAN/config.json",
+  "vqgan_checkpoint": "/root/DCVC-VQGAN/DCVC-family/DCVC/vqgan/RVQ-VQGAN/checkpoints/rvq_vqgan.pth",
+  "i_frame_size": null,
+  
+  "checkpoint_dir": "./checkpoints",
+  "lambda_value": 512,
+  "quality_index": 4,
+  "epochs_per_gop": 10,
+  "batch_size": 4,
+  "crop_size": 256,
+  "num_workers": 4,
+  "learning_rate": 1e-4,
+  
+  "eval_freq": 100,
+  "eval_max_frames": 96,
+  "skip_eval": false,
+  
+  "use_scheduler": false,
+  "scheduler_factor": 0.5,
+  "scheduler_patience": 3,
+  "scheduler_min_lr": 1e-6,
+  
+  "use_ema": true,
+  "ema_decay": 0.999,
+  "evaluate_both": true,
+  
+  "stage4_gop_opt": false,
+  
+  "grad_clip_max_norm": 1.0,
+  "compile": false,
+  "seed": 42,
+  "mixed_precision": "no",
+  "gradient_accumulation_steps": 1
+}
